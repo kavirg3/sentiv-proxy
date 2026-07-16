@@ -4724,8 +4724,7 @@ function Playbook({ state, update }) {
       var appFn = new Function(
         "React","ReactDOM","mammoth",
         "useState","useEffect","useRef","useMemo","useCallback",
-        compiled + "
-;return SentivSalesHub;"
+        compiled + "\n;return SentivSalesHub;"
       );
       window.__SentivApp = appFn(
         R, RD, mm,
