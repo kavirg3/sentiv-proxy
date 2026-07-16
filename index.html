@@ -4712,20 +4712,25 @@ function Playbook({ state, update }) {
       var src = document.getElementById("app-src").textContent;
       var compiled = window.Babel.transform(src, { presets: ["react"] }).code;
       // Expose React hooks + libs, then evaluate the compiled app in this scope.
-      // Expose everything on window so the eval'd code finds it regardless of strict mode.
-      window.React = window.React;
-      window.ReactDOM = window.ReactDOM;
-      window.mammoth = window.mammoth || {};
-      window.useState = React.useState;
-      window.useEffect = React.useEffect;
-      window.useRef = React.useRef;
-      window.useMemo = React.useMemo;
-      window.useCallback = React.useCallback;
-      var React = window.React, ReactDOM = window.ReactDOM, mammoth = window.mammoth;
-      var useState = React.useState, useEffect = React.useEffect, useRef = React.useRef,
-          useMemo = React.useMemo, useCallback = React.useCallback;
+      // Prefix the compiled code with all globals it needs — the safest way to inject
+      // scope into an eval block without relying on var hoisting or strict-mode leakage.
+      // No eval — use Function constructor with explicit named parameters.
+      // This is the only approach that reliably injects scope in all browsers.
+      var R = window.React;
+      var RD = window.ReactDOM;
+      var mm = window.mammoth || {};
       // eslint-disable-next-line no-eval
-      (0, eval)(compiled + "\n;window.__SentivApp = SentivSalesHub;");
+      // Build the function with all needed globals as named params, call it immediately.
+      var appFn = new Function(
+        "React","ReactDOM","mammoth",
+        "useState","useEffect","useRef","useMemo","useCallback",
+        compiled + "
+;return SentivSalesHub;"
+      );
+      window.__SentivApp = appFn(
+        R, RD, mm,
+        R.useState, R.useEffect, R.useRef, R.useMemo, R.useCallback
+      );
       var App = window.__SentivApp;
       if (typeof App !== "function") throw new Error("App component didn't define after compile.");
       ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
