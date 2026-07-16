@@ -4712,6 +4712,15 @@ function Playbook({ state, update }) {
       var src = document.getElementById("app-src").textContent;
       var compiled = window.Babel.transform(src, { presets: ["react"] }).code;
       // Expose React hooks + libs, then evaluate the compiled app in this scope.
+      // Expose everything on window so the eval'd code finds it regardless of strict mode.
+      window.React = window.React;
+      window.ReactDOM = window.ReactDOM;
+      window.mammoth = window.mammoth || {};
+      window.useState = React.useState;
+      window.useEffect = React.useEffect;
+      window.useRef = React.useRef;
+      window.useMemo = React.useMemo;
+      window.useCallback = React.useCallback;
       var React = window.React, ReactDOM = window.ReactDOM, mammoth = window.mammoth;
       var useState = React.useState, useEffect = React.useEffect, useRef = React.useRef,
           useMemo = React.useMemo, useCallback = React.useCallback;
