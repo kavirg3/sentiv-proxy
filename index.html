@@ -244,13 +244,24 @@ async function sbFetch(path, opts = {}) {
 }
 // Leads live in one JSONB column keyed by id — zero schema drift as the app evolves.
 async function teamLoadLeads() {
-  const rows = (await sbFetch("leads?select=id,data,updated_at,agent_id,profiles(full_name)&order=updated_at.desc", { headers: { "Prefer": "" }, method: "GET" })) || [];
+  // Two plain queries joined client-side. The single-request embed
+  // (profiles(full_name)) needs a perfect FK chain for PostgREST to resolve —
+  // one mismatch and the whole load 400s. Two flat selects can't fail that way.
+  const rows = (await sbFetch("leads?select=id,data,updated_at,agent_id&order=updated_at.desc", { headers: { "Prefer": "" }, method: "GET" })) || [];
+  let names = {};
+  try {
+    const profs = (await sbFetch("profiles?select=id,full_name", { headers: { "Prefer": "" }, method: "GET" })) || [];
+    profs.forEach((p) => { names[p.id] = p.full_name; });
+  } catch (e) { /* names are cosmetic — leads still load without them */ }
   // Attach agent attribution to each lead object (used by the owner dashboard).
-  return rows.map((r) => ({ ...r, data: r.data ? { ...r.data, _agentId: r.agent_id, _agentName: r.profiles?.full_name || "Agent" } : r.data }));
+  return rows.map((r) => ({ ...r, data: r.data ? { ...r.data, _agentId: r.agent_id, _agentName: names[r.agent_id] || "Agent" } : r.data }));
 }
 async function teamUpsertLead(lead) {
   const { _agentId, _agentName, ...data } = lead; // attribution is server-derived, never client-sent
-  try { await sbFetch("leads", { method: "POST", body: JSON.stringify([{ id: lead.id, norm_company: normCo(lead.company), data, updated_at: new Date().toISOString() }]) }); } catch (e) { console.warn("team push failed", e.message); }
+  if (!SESSION.userId) return; // not signed in — nothing to push against
+  // agent_id must be present and equal auth.uid(): the column is NOT NULL and the
+  // RLS insert policy checks it. Omitting it made every push fail with a 400.
+  try { await sbFetch("leads", { method: "POST", body: JSON.stringify([{ id: lead.id, agent_id: SESSION.userId, norm_company: normCo(lead.company), data, updated_at: new Date().toISOString() }]) }); } catch (e) { console.warn("team push failed", e.message); }
 }
 // Debounced push — drawer edits fire on every keystroke; batch them per lead.
 const _pushTimers = {};
@@ -262,7 +273,8 @@ async function teamLoadRows(table) {
   return (await sbFetch(`${table}?select=id,data,updated_at&order=updated_at.desc`, { headers: { "Prefer": "" }, method: "GET" })) || [];
 }
 async function teamUpsertRow(table, id, data) {
-  try { await sbFetch(table, { method: "POST", body: JSON.stringify([{ id, data, updated_at: new Date().toISOString() }]) }); } catch (e) { console.warn("sync push failed", table, e.message); }
+  if (!SESSION.userId) return; // not signed in — nothing to push against
+  try { await sbFetch(table, { method: "POST", body: JSON.stringify([{ id, agent_id: SESSION.userId, data, updated_at: new Date().toISOString() }]) }); } catch (e) { console.warn("sync push failed", table, e.message); }
 }
 async function teamDeleteRow(table, id) {
   try { await sbFetch(`${table}?id=eq.${encodeURIComponent(id)}`, { method: "DELETE" }); } catch (e) { /* offline — next diff retries */ }
@@ -972,25 +984,31 @@ function SentivSalesHub() {
   const handleAuthed = async (d) => {
     setSession(d);
     setSyncStatus("connecting");
+    // Profile is essential (it decides role). If IT fails, rethrow so the sign-in
+    // screen shows a real error instead of freezing on "One moment…".
+    const profile = await loadProfile();
+    // Data loads are NOT essential to complete sign-in. If any fail (schema drift,
+    // RLS mishap, offline), enter the app anyway with what we have — a degraded
+    // session beats a stranded login button and a silently cleared session.
+    let rows = [], pRows = [], dRows = [], tset = null, degraded = false;
+    try { rows = await teamLoadLeads(); } catch (e) { degraded = true; console.warn("leads load failed", e.message); }
     try {
-      const profile = await loadProfile();
-      const rows = await teamLoadLeads();
-      const [pRows, dRows, tset] = await Promise.all([
+      [pRows, dRows, tset] = await Promise.all([
         teamLoadRows("partners").catch(() => []),
         teamLoadRows("documents").catch(() => []),
         teamLoadSettings(),
       ]);
-      const mergeById = (local, remote) => { const m = {}; remote.forEach((r) => { if (r.data && r.data.id) m[r.data.id] = r.data; }); (local || []).forEach((l) => { if (!m[l.id]) m[l.id] = l; }); return Object.values(m); };
-      setState((s) => ({
-        ...s, session: { refresh: SESSION.refresh, userId: SESSION.userId }, role: profile.role, agentName: profile.full_name,
-        leads: rows.map((r) => r.data).filter(Boolean),
-        partners: mergeById(s.partners, pRows),
-        documents: mergeById(s.documents, dRows),
-        ...(tset ? { permissions: tset.permissions || s.permissions, targets: tset.targets || s.targets, cadenceRules: tset.cadenceRules || s.cadenceRules } : {}),
-      }));
-      setTab(profile.role === "owner" ? "team" : "command");
-      setSyncStatus("live");
-    } catch (e) { clearSession(); setSyncStatus("offline"); }
+    } catch (e) { degraded = true; }
+    const mergeById = (local, remote) => { const m = {}; remote.forEach((r) => { if (r.data && r.data.id) m[r.data.id] = r.data; }); (local || []).forEach((l) => { if (!m[l.id]) m[l.id] = l; }); return Object.values(m); };
+    setState((s) => ({
+      ...s, session: { refresh: SESSION.refresh, userId: SESSION.userId }, role: profile.role, agentName: profile.full_name,
+      leads: rows.length ? rows.map((r) => r.data).filter(Boolean) : s.leads,
+      partners: mergeById(s.partners, pRows),
+      documents: mergeById(s.documents, dRows),
+      ...(tset ? { permissions: tset.permissions || s.permissions, targets: tset.targets || s.targets, cadenceRules: tset.cadenceRules || s.cadenceRules } : {}),
+    }));
+    setTab(profile.role === "owner" ? "team" : "command");
+    setSyncStatus(degraded ? "offline" : "live");
   };
   const signOut = () => {
     clearSession();
@@ -1425,8 +1443,12 @@ function AuthGate({ onAuthed, openSettings }) {
         await onAuthed(d);
         return;
       }
-    } catch (e) { setMsg({ ok: false, t: e.message || "Sign-in failed" }); }
-    setBusy(false);
+    } catch (e) {
+      // Show whatever actually failed (bad password, profile load, network) —
+      // the button must never strand on "One moment…" with no explanation.
+      if (SESSION.token) clearSession();
+      setMsg({ ok: false, t: e.message || "Sign-in failed" });
+    } finally { setBusy(false); }
   };
 
   return (
