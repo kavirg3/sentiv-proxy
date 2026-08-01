@@ -7,12 +7,12 @@ const cors = require("cors");
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
-const push = require("./push-routes");
-app.use("/api/push", push);  
 const rawOrigins = (process.env.ALLOWED_ORIGINS || "*").trim();
 const corsOrigin = rawOrigins === "*" ? "*" : rawOrigins.split(",").map((o) => o.trim().replace(/\/+$/, "")).filter(Boolean);
 app.use(cors({ origin: corsOrigin === "*" ? "*" : (origin, cb) => { if (!origin) return cb(null, true); cb(null, corsOrigin.includes(origin.replace(/\/+$/, ""))); } }));
 app.options("*", cors());
+const push = require("./push-routes");
+app.use("/api/push", push);
 const need = (res, pairs) => {
   const missing = Object.entries(pairs).filter(([, v]) => !v).map(([k]) => k);
   if (missing.length) { res.status(400).json({ error: `missing: ${missing.join(", ")}` }); return true; }
