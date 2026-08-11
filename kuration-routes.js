@@ -95,26 +95,83 @@ async function kur(path, { method = "GET", body, project } = {}) {
   return d;
 }
 
-// Kuration returns each field as { name, value, status, is_loading }. The browser only
-// needs the value plus whether it is still cooking and where it came from.
+// Kuration returns each field as { name, value, status, is_loading } KEYED BY col_id
+// (a UUID), not by column name. The browser matches on human column names, so re-key
+// here. Keying the browser payload by UUID silently maps nothing — every field arrives
+// and none of it lands, which looks like "Kuration returned no data".
 function slimCompany(company) {
   const out = {};
   let pending = 0;
   Object.entries(company || {}).forEach(([k, v]) => {
     if (v && typeof v === "object" && "value" in v) {
-      out[k] = { value: v.value == null ? "" : v.value, status: v.status || "", loading: !!v.is_loading };
+      const key = v.name && String(v.name).trim() ? String(v.name).trim() : k;
+      out[key] = { value: v.value == null ? "" : v.value, status: v.status || "", loading: !!v.is_loading, col_id: k };
       if (v.is_loading) pending++;
     } else {
-      out[k] = { value: v == null ? "" : v, status: "", loading: false };
+      out[k] = { value: v == null ? "" : v, status: "", loading: false, col_id: k };
     }
   });
   return { fields: out, pending };
 }
 
+// ---------------------------------------------------------------- schema resolution
+// Submitting a row requires EVERY required column, keyed by col_id — names are rejected
+// with "Missing required columns". Column ids are per-project UUIDs, so they cannot be
+// hard-coded without breaking the moment the project is edited. Fetch and cache instead.
+const SCHEMA_TTL_MS = 10 * 60 * 1000;
+let schemaCache = { at: 0, project: "", cols: null };
+
+const norm = (s) => String(s == null ? "" : s).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+
+async function schemaFor(project) {
+  if (schemaCache.cols && schemaCache.project === project && Date.now() - schemaCache.at < SCHEMA_TTL_MS) {
+    return schemaCache.cols;
+  }
+  const d = await kur(`/projects/${encodeURIComponent(project)}`, { project });
+  const cols = Array.isArray(d && d.columns) ? d.columns : [];
+  schemaCache = { at: Date.now(), project, cols };
+  return cols;
+}
+
+// Find the column a value belongs in. Exact normalised name first, then substring, so
+// "company_name" beats "Extracted Company Phone Number From Company Name" — which also
+// contains the string "company_name" and would otherwise swallow the company field.
+function findCol(cols, aliases) {
+  for (const a of aliases) {
+    const hit = cols.find((c) => norm(c.name) === a);
+    if (hit) return hit.col_id;
+  }
+  for (const a of [...aliases].sort((x, y) => y.length - x.length)) {
+    const hit = cols.find((c) => norm(c.name).includes(a));
+    if (hit) return hit.col_id;
+  }
+  return null;
+}
+
+// Values for the system_* columns Kuration marks required. It accepts free text here —
+// these are provenance labels, not validated enums. Anything required that we do not
+// recognise is sent as an empty string rather than omitted, because omission is what
+// triggers the 400.
+function systemValue(colId, nowIso) {
+  switch (colId) {
+    case "system_row_source": return process.env.KURATION_ROW_SOURCE || "Sentiv Sales Hub";
+    case "system_row_discovered_by": return process.env.KURATION_ROW_ACTOR || "sentiv-sales-hub";
+    case "system_row_discovered_at":
+    case "system_row_updated_at": return nowIso;
+    default: return "";
+  }
+}
+
 // ---------------------------------------------------------------- health
+// Bump this string whenever this file changes. It is the only reliable way to tell
+// "my fix is live" from "I am still looking at the previous deploy" — a distinction
+// that has already cost hours on this project once.
+const CODE_VERSION = "v42.1-colid";
+
 router.get("/health", (_req, res) => {
   res.json({
     ok: !!KEY && !!PROJECT,
+    codeVersion: CODE_VERSION,
     apiKey: KEY ? "set" : "MISSING",
     projectId: PROJECT ? "set" : "MISSING",
     webhookSecret: WEBHOOK_SECRET ? "set" : "MISSING (webhook will reject everything)",
@@ -153,12 +210,34 @@ router.post("/rows", express.json({ limit: "1mb" }), async (req, res) => {
     return res.status(400).json({ error: `Too many rows (${list.length}). Max ${MAX_ROWS_PER_REQUEST} per request — this ceiling protects your credit balance.` });
   }
 
+  // Resolve the project's column ids once for the whole batch. If this fails the batch
+  // fails as a unit — better than firing 50 requests that will each 400 identically.
+  let cols;
+  try {
+    cols = await schemaFor(project);
+  } catch (e) {
+    return res.status(e.status || 502).json({ error: `could not read project schema: ${e.message}` });
+  }
+  const nameCol = findCol(cols, ["company_name", "company", "name", "legal_name"]);
+  const siteCol = findCol(cols, ["website", "domain", "url", "company_website"]);
+  if (!nameCol) {
+    return res.status(500).json({ error: "project has no company-name column — check KURATION_PROJECT_ID points at the lead-enrichment project" });
+  }
+  const required = cols.filter((c) => c && c.required && c.col_id);
+
   const out = [];
   for (const c of list) {
     const name = String((c && (c.company_name || c.company)) || "").trim();
     if (!name) { out.push({ company_name: "", error: "missing company_name" }); continue; }
-    const company = { company_name: name };
-    if (c.website) company.website = String(c.website).trim();
+
+    const nowIso = new Date().toISOString();
+    const company = {};
+    // Every required column must be present, keyed by col_id. Fill the system ones,
+    // then overwrite the two we actually have real data for.
+    required.forEach((col) => { company[col.col_id] = systemValue(col.col_id, nowIso); });
+    company[nameCol] = name;
+    if (siteCol) company[siteCol] = c.website ? String(c.website).trim() : "";
+
     try {
       const d = await kur("/projects/:project/rows", { method: "POST", body: { company }, project });
       if (d && d.row_id) { stats.submitted++; stats.lastSubmitAt = new Date().toISOString(); }
@@ -246,4 +325,4 @@ router.post("/webhook", express.raw({ type: "*/*", limit: "512kb" }), async (req
 module.exports = router;
 // Exported for verify-kuration.mjs. Keeping the signature check testable is the whole
 // reason the WhatsApp core lives in its own file — same lesson, smaller surface.
-module.exports.__test = { verifySig, slimCompany, MAX_ROWS_PER_REQUEST };
+module.exports.__test = { verifySig, slimCompany, MAX_ROWS_PER_REQUEST, findCol, norm, systemValue };
