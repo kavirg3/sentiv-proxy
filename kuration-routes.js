@@ -133,17 +133,21 @@ async function schemaFor(project) {
   return cols;
 }
 
-// Find the column a value belongs in. Exact normalised name first, then substring, so
-// "company_name" beats "Extracted Company Phone Number From Company Name" — which also
-// contains the string "company_name" and would otherwise swallow the company field.
+// Find the column a value belongs in, and return its NAME — the submit endpoint keys on
+// column names, not ids. We know this empirically, not from docs: submitting by name
+// produced a "missing columns" list that omitted company_name (i.e. it was recognised),
+// while submitting the same row keyed by col_id came back with EVERY column missing.
+// Exact normalised name first, then substring, so "company_name" beats "Extracted
+// Company Phone Number From Company Name" — which contains the string "company_name"
+// and would otherwise swallow the company field.
 function findCol(cols, aliases) {
   for (const a of aliases) {
     const hit = cols.find((c) => norm(c.name) === a);
-    if (hit) return hit.col_id;
+    if (hit) return hit.name;
   }
   for (const a of [...aliases].sort((x, y) => y.length - x.length)) {
     const hit = cols.find((c) => norm(c.name).includes(a));
-    if (hit) return hit.col_id;
+    if (hit) return hit.name;
   }
   return null;
 }
@@ -166,7 +170,7 @@ function systemValue(colId, nowIso) {
 // Bump this string whenever this file changes. It is the only reliable way to tell
 // "my fix is live" from "I am still looking at the previous deploy" — a distinction
 // that has already cost hours on this project once.
-const CODE_VERSION = "v42.1-colid";
+const CODE_VERSION = "v42.2-names";
 
 router.get("/health", (_req, res) => {
   res.json({
@@ -232,9 +236,11 @@ router.post("/rows", express.json({ limit: "1mb" }), async (req, res) => {
 
     const nowIso = new Date().toISOString();
     const company = {};
-    // Every required column must be present, keyed by col_id. Fill the system ones,
-    // then overwrite the two we actually have real data for.
-    required.forEach((col) => { company[col.col_id] = systemValue(col.col_id, nowIso); });
+    // Every required column must be present, keyed by column NAME. Fill the system ones
+    // first, then overwrite the two we actually have real data for. Note website is sent
+    // even when blank: omitting a required column is what triggers the 400, and a lead
+    // with no website is common.
+    required.forEach((col) => { company[col.name] = systemValue(col.col_id, nowIso); });
     company[nameCol] = name;
     if (siteCol) company[siteCol] = c.website ? String(c.website).trim() : "";
 
