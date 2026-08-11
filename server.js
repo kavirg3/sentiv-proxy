@@ -6,13 +6,14 @@ const express = require("express");
 const cors = require("cors");
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
-const rawOrigins = (process.env.ALLOWED_ORIGINS || "*").trim();
-const corsOrigin = rawOrigins === "*" ? "*" : rawOrigins.split(",").map((o) => o.trim().replace(/\/+$/, "")).filter(Boolean);
-app.use(cors({ origin: corsOrigin === "*" ? "*" : (origin, cb) => { if (!origin) return cb(null, true); cb(null, corsOrigin.includes(origin.replace(/\/+$/, ""))); } }));
-app.options("*", cors());
-const push = require("./push-routes");
-app.use("/api/push", push);
+// The `verify` hook keeps a copy of the raw bytes on req.rawBody. Both the WhatsApp
+// and Kuration webhooks verify an HMAC over the RAW request body — once express.json()
+// has parsed and discarded the stream, re-serialising the object does NOT reproduce the
+// same bytes (unicode escapes and key order differ), so every signature would fail in a
+// way that looks exactly like a wrong secret.
+app.use(express.json({ limit: "2mb", verify: (req, _res, buf) => { req.rawBody = buf; } }));
+app.use(cors({ origin: (process.env.ALLOWED_ORIGINS || "*").split(",") }));
+
 const need = (res, pairs) => {
   const missing = Object.entries(pairs).filter(([, v]) => !v).map(([k]) => k);
   if (missing.length) { res.status(400).json({ error: `missing: ${missing.join(", ")}` }); return true; }
@@ -32,7 +33,19 @@ const upstream = async (res, url, opts, label) => {
   } catch (e) { res.status(502).json({ error: `${label} unreachable: ${e.message}` }); }
 };
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "sentiv-sales-hub-proxy" }));
+app.get("/health", (_req, res) => res.json({
+  ok: true,
+  service: "sentiv-sales-hub-proxy",
+  routes: ["anthropic", "euphoria", "vbout", "manyreach", "repliq", "pcloud", "whatsapp", "kuration"],
+}));
+
+// ---- Mounted route modules -------------------------------------------------
+// Each one fails closed: without its environment variables it answers with a clear
+// "not configured" error rather than half-working. Mounting them costs nothing.
+//   /api/kuration/health   /api/whatsapp/health   report exactly what is missing.
+app.use("/api/kuration", require("./kuration-routes"));
+app.use("/api/pcloud", require("./pcloud-routes"));
+app.use("/api/whatsapp", require("./whatsapp-routes"));
 
 // ---- Euphoria click-to-dial: rings the agent's extension, then the client ----
 // App sends: { extension, number, company }
