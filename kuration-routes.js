@@ -56,6 +56,9 @@ const WEBHOOK_SECRET = process.env.KURATION_WEBHOOK_SECRET || "";
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
 const ALLOW_UNSIGNED = process.env.KURATION_ALLOW_UNSIGNED === "1";
+// Server-side spend ceiling for a single builder run (v48). The browser asks for a
+// row count; this is what actually gets sent. Raise it deliberately, not by accident.
+const MAX_SWEEP_ROWS = parseInt(process.env.KURATION_MAX_SWEEP_ROWS || "100", 10) || 100;
 
 // Submitting a row is the only call that spends credits, so it is the only one worth
 // rate-limiting and counting. These counters are process-local and reset on redeploy —
@@ -289,6 +292,97 @@ function verifySig(raw, sig) {
   if (a.length !== b.length) return false;            // timingSafeEqual throws on length mismatch
   return crypto.timingSafeEqual(a, b);
 }
+
+// ============================================================================
+// v48 — BUILDER SOURCING
+// Until now this proxy only did enrichment: the Hub sent company names and Kuration
+// filled in the details. These three routes expose the other half of the product —
+// Kuration sourcing the list itself — while keeping the API key server-side.
+//
+// Discovery is deliberately a separate route from the run. `GET /project-builders`
+// returns only the builders THIS account is permitted to run, each with a form_data
+// template. The Hub renders whatever comes back rather than hardcoding a list, so a
+// plan change or a renamed builder degrades to "no builders available" instead of a
+// broken screen.
+// ============================================================================
+
+// GET /api/kuration/builders — what can this account actually run?
+// Read-only and free: safe to call on every page load.
+router.get("/builders", async (_req, res) => {
+  if (!KEY) return res.status(400).json({ error: "KURATION_API_KEY not set" });
+  try {
+    const r = await kur("/project-builders", { method: "GET" });
+    // The API returns a bare array here (unlike /projects, which wraps). Normalise so
+    // the client never has to care which.
+    res.json({ builders: Array.isArray(r) ? r : (r && r.builders) || [] });
+  } catch (e) {
+    res.status(502).json({ error: e.message || "could not reach Kuration" });
+  }
+});
+
+// POST /api/kuration/sweeps — create a project from a builder. THIS SPENDS CREDITS.
+// The Hub shows the agent a cost estimate and takes a confirmation before calling
+// this; the guard here is the second line of defence, not the first.
+router.post("/sweeps", express.json({ limit: "256kb" }), async (req, res) => {
+  if (!KEY) return res.status(400).json({ error: "KURATION_API_KEY not set" });
+  const builderId = req.body && req.body.builder_id;
+  const formData = req.body && req.body.form_data;
+  if (!builderId || typeof builderId !== "string") return res.status(400).json({ error: "builder_id is required" });
+  if (!formData || typeof formData !== "object" || Array.isArray(formData)) return res.status(400).json({ error: "form_data must be an object" });
+
+  // Hard ceiling on max_results. A typo — 500 instead of 50 — is a month of credits
+  // gone in one click, and the browser is not a trustworthy place to enforce a spend
+  // limit. Clamp here, where the agent cannot reach.
+  const capped = { ...formData };
+  const n = parseInt(String(capped.max_results != null ? capped.max_results : ""), 10);
+  if (isFinite(n)) capped.max_results = Math.max(1, Math.min(n, MAX_SWEEP_ROWS));
+  else if ("max_results" in capped) delete capped.max_results;
+
+  try {
+    const r = await kur("/projects", {
+      method: "POST",
+      body: JSON.stringify({ builder_id: builderId, form_data: capped }),
+    });
+    res.json({ project_id: (r && (r.project_id || r.id)) || null, capped_to: capped.max_results });
+  } catch (e) {
+    res.status(502).json({ error: e.message || "could not start the sweep" });
+  }
+});
+
+// GET /api/kuration/sweeps/:id — builder status + row count, for the progress line.
+router.get("/sweeps/:id", async (req, res) => {
+  if (!KEY) return res.status(400).json({ error: "KURATION_API_KEY not set" });
+  try {
+    const r = await kur(`/projects/${encodeURIComponent(req.params.id)}`, { method: "GET" });
+    res.json({
+      builder_status: (r && r.builder_status) || { type: "running", error_message: null },
+      row_count: (r && r.row_count) || 0,
+      columns: (r && r.columns) || [],
+    });
+  } catch (e) {
+    res.status(502).json({ error: e.message || "could not read the sweep" });
+  }
+});
+
+// GET /api/kuration/sweeps/:id/rows — the sourced companies.
+// page_size is clamped to the API's documented 1-100 range; an out-of-range value is
+// a 422 from Kuration, which surfaces to the agent as a meaningless error.
+router.get("/sweeps/:id/rows", async (req, res) => {
+  if (!KEY) return res.status(400).json({ error: "KURATION_API_KEY not set" });
+  const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
+  const size = Math.max(1, Math.min(100, parseInt(String(req.query.page_size || "100"), 10) || 100));
+  try {
+    const r = await kur(`/projects/${encodeURIComponent(req.params.id)}/rows?page=${page}&page_size=${size}`, { method: "GET" });
+    res.json({
+      rows: (r && r.rows) || [],
+      page: (r && r.page) || page,
+      total_rows: (r && r.total_rows) || 0,
+      total_pages: (r && r.total_pages) || 1,
+    });
+  } catch (e) {
+    res.status(502).json({ error: e.message || "could not read the sweep rows" });
+  }
+});
 
 router.post("/webhook", express.raw({ type: "*/*", limit: "512kb" }), async (req, res) => {
   const raw = Buffer.isBuffer(req.body) ? req.body : (req.rawBody || Buffer.from(""));
