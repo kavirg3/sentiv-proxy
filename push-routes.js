@@ -53,6 +53,10 @@ const QUIET_START = num(process.env.PUSH_QUIET_START, 7);
 const QUIET_END = num(process.env.PUSH_QUIET_END, 18);
 const STALE_DAYS = num(process.env.PUSH_STALE_DAYS, 7);
 const LOG_KEEP_DAYS = num(process.env.PUSH_LOG_KEEP_DAYS, 30);
+// Most an agent can be buzzed in one day. The first real sweep found 97 deals deserving
+// a nudge for ONE agent — 78 of them merely going cold — which is not a notification
+// system, it is noise somebody learns to swipe away. Five is a morning's work.
+const MAX_PER_AGENT = num(process.env.PUSH_MAX_PER_AGENT, 5);
 
 function num(v, d) { const n = Number(v); return Number.isFinite(n) ? n : d; }
 
@@ -191,6 +195,18 @@ function payloadFor(r, kind) {
   };
 }
 
+// Which five: the most valuable, rand for rand, whatever the reason. A deal with no
+// value set sorts as 0 and falls to the back — which is what you want when 95 of 98 open
+// deals carry no figure at all. Where two deals are worth the same, the follow-up wins:
+// that one is a date the agent committed to, the other is only drifting.
+const leadValue = (it) => { const v = Number(it && it.r && it.r.data && it.r.data.value); return Number.isFinite(v) ? v : 0; };
+const rankForAgent = (list) => list.slice().sort((a, b) => {
+  const d = leadValue(b) - leadValue(a);
+  if (d !== 0) return d;
+  if (a.kind !== b.kind) return a.kind === "followup" ? -1 : 1;
+  return 0;
+});
+
 // The debounce log is a debounce, not an archive. Trimmed once a day, on the first
 // sweep of that day — cheap, and nobody has to remember to run it.
 let _lastPrune = "";
@@ -250,6 +266,17 @@ router.post("/sweep", async (req, res) => {
     const byAgent = {};
     fresh.forEach((it) => { (byAgent[it.r.agent_id] = byAgent[it.r.agent_id] || []).push(it); });
 
+    // Cap BEFORE the push_log write, never after. The log is what suppresses a repeat
+    // tomorrow, so logging a deal we deliberately did not send would bury it for good —
+    // it would be marked "already notified" having never buzzed anything. Held-back
+    // deals stay unlogged and come back tomorrow, once the bigger ones are cleared.
+    let held = 0;
+    Object.keys(byAgent).forEach((agentId) => {
+      const ranked = rankForAgent(byAgent[agentId]);
+      if (ranked.length > MAX_PER_AGENT) held += ranked.length - MAX_PER_AGENT;
+      byAgent[agentId] = ranked.slice(0, MAX_PER_AGENT);
+    });
+
     let sent = 0, pruned = 0, notified = 0;
     for (const [agentId, list] of Object.entries(byAgent)) {
       const subs = await subsFor(agentId);
@@ -269,7 +296,7 @@ router.post("/sweep", async (req, res) => {
       due: items.length,
       followups: fresh.filter((i) => i.kind === "followup").length,
       stale: fresh.filter((i) => i.kind === "stale").length,
-      leadsNotified: notified, sent, pruned,
+      leadsNotified: notified, sent, pruned, held, maxPerAgent: MAX_PER_AGENT,
     });
   } catch (e) {
     res.status(500).json({ error: e.message || "sweep failed" });
