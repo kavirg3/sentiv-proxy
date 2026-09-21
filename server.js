@@ -36,7 +36,7 @@ const upstream = async (res, url, opts, label) => {
 app.get("/health", (_req, res) => res.json({
   ok: true,
   service: "sentiv-sales-hub-proxy",
-  routes: ["anthropic", "euphoria", "vbout", "manyreach", "repliq", "pcloud", "whatsapp", "kuration"],
+  routes: ["anthropic", "euphoria", "vbout", "manyreach", "repliq", "pcloud", "whatsapp", "kuration", "push"],
 }));
 
 // ---- Mounted route modules -------------------------------------------------
@@ -46,6 +46,7 @@ app.get("/health", (_req, res) => res.json({
 app.use("/api/kuration", require("./kuration-routes"));
 app.use("/api/pcloud", require("./pcloud-routes"));
 app.use("/api/whatsapp", require("./whatsapp-routes"));
+app.use("/api/push", require("./push-routes"));
 
 // ---- Euphoria click-to-dial: rings the agent's extension, then the client ----
 // App sends: { extension, number, company }
