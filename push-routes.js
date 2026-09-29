@@ -173,6 +173,38 @@ router.post("/test", async (req, res) => {
   }
 });
 
+// Owner-only: send one test buzz to SOMEONE ELSE's devices (Hub v151 — the "Send test"
+// button on the owner's weekly card). The caller's own Supabase session proves who they
+// are; their role is read with the service key, never taken from the request. One test
+// per person per minute, so a double-tap can't turn into a buzz storm.
+const _lastTest = {};
+router.post("/test-user", async (req, res) => {
+  if (!need(res)) return;
+  try {
+    const user = await userFromToken(req);
+    if (!user) return res.status(401).json({ error: "sign in first — no valid Supabase session on this request" });
+    const me = ((await sb(`profiles?select=role&id=eq.${encodeURIComponent(user.id)}`)) || [])[0];
+    if (!me || me.role !== "owner") return res.status(403).json({ error: "only the owner can test someone else's notifications" });
+    const target = String((req.body && req.body.userId) || "").trim();
+    if (!/^[0-9a-f-]{36}$/i.test(target)) return res.status(400).json({ error: "userId missing or not a valid id" });
+    const now = Date.now();
+    if (_lastTest[target] && now - _lastTest[target] < 60000) return res.status(429).json({ error: "just sent one — wait a minute before testing this person again" });
+    const subs = await subsFor(target);
+    if (!subs.length) return res.status(404).json({ error: "this person has no device with notifications on" });
+    _lastTest[target] = now;
+    const out = await sendTo(subs, {
+      title: "Sentiv Sales Hub — test",
+      body: "Your notifications are working. You'll get follow-up alerts here, and a short note about your deals every Monday.",
+      tag: "sentiv-test",
+      url: `${APP_URL}/`,
+      actions: [{ action: "open", title: "Open Hub" }],
+    });
+    res.json({ ok: true, devices: subs.length, ...out });
+  } catch (e) {
+    res.status(500).json({ error: e.message || "test push failed" });
+  }
+});
+
 // What a notification says, for each of the two reasons we send one.
 function payloadFor(r, kind) {
   const d = r.data || {};
