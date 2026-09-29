@@ -78,6 +78,16 @@ async function withinRoot(folderid) {
   return false;
 }
 
+// Same fence for single files. Without it, a fileid from outside the vault
+// (e.g. a nightly backup in a sibling folder) could still be opened or shared.
+async function fileWithinRoot(fileid) {
+  if (ROOT === "0") return true;
+  const d = await pc("checksumfile", { fileid });
+  const parent = d.metadata && d.metadata.parentfolderid;
+  if (parent === undefined || parent === null) return false;
+  return withinRoot(String(parent));
+}
+
 // --- list a folder ----------------------------------------------------------
 router.post("/list", async (req, res) => {
   if (!need(res)) return;
@@ -122,6 +132,7 @@ router.post("/link", async (req, res) => {
   const fileid = req.body && req.body.fileid;
   if (!fileid) return res.status(400).json({ error: "fileid required" });
   try {
+    if (!(await fileWithinRoot(fileid))) return res.status(403).json({ error: "file outside the agent vault" });
     const d = await pc("getfilelink", { fileid });
     const host = (d.hosts && d.hosts[0]) || "";
     if (!host || !d.path) throw new Error("pCloud returned no host");
@@ -137,6 +148,7 @@ router.post("/share", async (req, res) => {
   const fileid = req.body && req.body.fileid;
   if (!fileid) return res.status(400).json({ error: "fileid required" });
   try {
+    if (!(await fileWithinRoot(fileid))) return res.status(403).json({ error: "file outside the agent vault" });
     const d = await pc("getfilepublink", { fileid });
     res.json({ link: d.link, code: d.code || null });
   } catch (e) {
@@ -155,6 +167,7 @@ router.post("/fetch", async (req, res) => {
   const fileid = req.body && req.body.fileid;
   if (!fileid) return res.status(400).json({ error: "fileid required" });
   try {
+    if (!(await fileWithinRoot(fileid))) return res.status(403).json({ error: "file outside the agent vault" });
     const meta = await pc("checksumfile", { fileid });
     const size = (meta.metadata && meta.metadata.size) || 0;
     if (size > MAX_FETCH_BYTES) return res.status(413).json({ error: `file is ${Math.round(size / 1048576)}MB — too large to read into the Brain` });
