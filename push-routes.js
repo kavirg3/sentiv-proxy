@@ -150,7 +150,7 @@ router.get("/health", (_req, res) => {
     quietHours: `${QUIET_START}:00–${QUIET_END}:00 SAST`,
     staleDays: STALE_DAYS || "off",
     appUrl: APP_URL,
-    weeklyDigest: `Mondays from ${DIGEST_HOUR}:00 SAST, to the owner`,
+    weeklyDigest: `Mondays from ${DIGEST_HOUR}:00 SAST — team numbers to the owner, own deals to each agent`,
   });
 });
 
@@ -236,6 +236,47 @@ function digestPayload(rows, now) {
   return { title: "Sentiv — last week's next steps", body, tag: "weekly-digest", url: `${APP_URL}/`, counts: { thisWeek: T, weekBefore: L } };
 }
 
+// Each AGENT's own Monday note (Hub v148): their deals only, what needs doing this week,
+// plus what they themselves saved and finished last week. Pure, like digestPayload.
+// Returns null when there is nothing worth a buzz (no open deals).
+function agentWeekPayload(leads, events, now, today) {
+  const open = (leads || []).filter((r) => r && r.data && !String(r.data.stage || "").startsWith("Closed"));
+  if (!open.length) return null;
+  const in7 = new Date(new Date(today + "T00:00:00Z").getTime() + 6 * 864e5).toISOString().slice(0, 10);
+  const coldCut = now - 7 * 864e5;
+  let overdue = 0, due = 0, cold = 0, noNext = 0;
+  open.forEach((r) => {
+    const d = r.data;
+    const f = d.followUp ? String(d.followUp) : "";
+    if (f && f < today) overdue++;
+    else if (f && f <= in7) due++;
+    if (Number(d.updatedAt) && Number(d.updatedAt) <= coldCut) cold++;
+    if (!String(d.nextAction || "").trim()) noNext++;
+  });
+  const wk = 7 * 864e5;
+  let saved = 0, done = 0;
+  (events || []).forEach((e) => {
+    const age = now - new Date(e.at).getTime();
+    if (!(age >= 0 && age < wk)) return;
+    if (e.kind === "next_set_ai" || e.kind === "next_set_rule") saved++;
+    else if (e.kind === "next_done") done++;
+  });
+  const parts = [];
+  if (overdue) parts.push(`${overdue} overdue`);
+  if (due) parts.push(`${due} follow-up${due === 1 ? "" : "s"} due`);
+  if (cold) parts.push(`${cold} going cold`);
+  if (noNext) parts.push(`${noNext} with no next step`);
+  const todo = parts.length ? `This week: ${parts.join(" · ")}.` : (open.length === 1 ? "Your open deal is on track." : `All ${open.length} open deals are on track.`);
+  const last = saved || done ? ` Last week you saved ${saved} next step${saved === 1 ? "" : "s"} and finished ${done}.` : "";
+  return {
+    title: "Your week — Sentiv",
+    body: todo + last,
+    tag: "weekly-agent",
+    url: `${APP_URL}/`,
+    counts: { open: open.length, overdue, due, cold, noNext, saved, done },
+  };
+}
+
 async function weeklyDigest(today, hour, force) {
   const dow = new Intl.DateTimeFormat("en-US", { timeZone: "Africa/Johannesburg", weekday: "short" }).format(new Date());
   if (!force && (dow !== "Mon" || hour < DIGEST_HOUR)) return { skipped: "not Monday morning" };
@@ -260,7 +301,35 @@ async function weeklyDigest(today, hour, force) {
     const out = await sendTo(subs, note);
     sent += out.sent;
   }
-  return { owners: owners.length, sent, already, noDevice, counts: payload.counts };
+  const agents = await agentDigests(today);
+  return { owners: owners.length, sent, already, noDevice, counts: payload.counts, agents };
+}
+
+async function agentDigests(today) {
+  const agents = (await sb("profiles?select=id&role=eq.agent")) || [];
+  if (!agents.length) return { agents: 0 };
+  // Only agents who can actually receive one are worth a leads read.
+  const reachable = [];
+  for (const a of agents) { const subs = await subsFor(a.id); if (subs.length) reachable.push({ id: a.id, subs }); }
+  if (!reachable.length) return { agents: agents.length, sent: 0, noDevice: agents.length };
+  const leads = (await sb("leads?select=id,agent_id,data")) || [];
+  const since = new Date(Date.now() - 7 * 864e5).toISOString();
+  const events = (await sb(`usage_events?select=agent_id,kind,at&at=gte.${encodeURIComponent(since)}&kind=in.(${NEXT_KINDS.join(",")})&limit=20000`)) || [];
+  let sent = 0, already = 0, nothing = 0;
+  for (const a of reachable) {
+    const p = agentWeekPayload(leads.filter((r) => r.agent_id === a.id), events.filter((e) => e.agent_id === a.id), Date.now(), today);
+    if (!p) { nothing++; continue; }
+    const fresh = await sb("push_log", {
+      method: "POST",
+      headers: { Prefer: "resolution=ignore-duplicates,return=representation" },
+      body: JSON.stringify([{ lead_id: `weekly-agent-${a.id}`, kind: "weekly", user_id: a.id, sent_on: today }]),
+    });
+    if (!Array.isArray(fresh) || !fresh.length) { already++; continue; }
+    const { counts, ...note } = p;
+    const out = await sendTo(a.subs, note);
+    sent += out.sent;
+  }
+  return { agents: agents.length, reachable: reachable.length, sent, already, nothing, noDevice: agents.length - reachable.length };
 }
 
 // The debounce log is a debounce, not an archive. Trimmed once a day, on the first
@@ -380,3 +449,4 @@ if (SWEEP_MS > 0 && SWEEP_SECRET) {
 
 module.exports = router;
 module.exports._digestPayload = digestPayload;   // for tests only
+module.exports._agentWeekPayload = agentWeekPayload;
