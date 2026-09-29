@@ -150,6 +150,7 @@ router.get("/health", (_req, res) => {
     quietHours: `${QUIET_START}:00–${QUIET_END}:00 SAST`,
     staleDays: STALE_DAYS || "off",
     appUrl: APP_URL,
+    weeklyDigest: `Mondays from ${DIGEST_HOUR}:00 SAST, to the owner`,
   });
 });
 
@@ -207,6 +208,61 @@ const rankForAgent = (list) => list.slice().sort((a, b) => {
   return 0;
 });
 
+// ---- Monday digest for the owner (Hub v147) ------------------------------------
+// Once a week, the owner gets ONE notification with last week's next-step numbers — the
+// same four counts as the "Next steps this week" card on the Team screen, read from the
+// same usage_events rows. Counts only: usage_events holds no deal, company or wording.
+// Rides the existing sweep, so it needs no new cron and obeys the same quiet hours.
+const DIGEST_HOUR = num(process.env.PUSH_DIGEST_HOUR, 8);   // Mondays, from this hour SAST
+const NEXT_KINDS = ["next_ai", "next_set_ai", "next_set_rule", "next_done"];
+
+// Pure: rows in, notification out. Kept apart from the I/O so it can be tested alone.
+function digestPayload(rows, now) {
+  const wk = 7 * 864e5;
+  const blank = () => ({ next_ai: 0, next_set_ai: 0, next_set_rule: 0, next_done: 0 });
+  const T = blank(), L = blank();
+  (rows || []).forEach((r) => {
+    if (!r || !(r.kind in T)) return;
+    const age = now - new Date(r.at).getTime();
+    if (!(age >= 0)) return;
+    if (age < wk) T[r.kind]++; else if (age < 2 * wk) L[r.kind]++;
+  });
+  const saved = T.next_set_ai + T.next_set_rule, savedBefore = L.next_set_ai + L.next_set_rule;
+  const d = saved - savedBefore;
+  const trend = d === 0 ? "same as the week before" : `${d > 0 ? "up" : "down"} ${Math.abs(d)} on the week before`;
+  const body = saved + T.next_done + T.next_ai === 0
+    ? "No next steps were saved or completed last week. Worth a word with the team."
+    : `AI wrote ${T.next_ai} line${T.next_ai === 1 ? "" : "s"} · agents saved ${saved} (${T.next_set_ai} from AI) · ${T.next_done} marked done. Saved ${trend}.`;
+  return { title: "Sentiv — last week's next steps", body, tag: "weekly-digest", url: `${APP_URL}/`, counts: { thisWeek: T, weekBefore: L } };
+}
+
+async function weeklyDigest(today, hour, force) {
+  const dow = new Intl.DateTimeFormat("en-US", { timeZone: "Africa/Johannesburg", weekday: "short" }).format(new Date());
+  if (!force && (dow !== "Mon" || hour < DIGEST_HOUR)) return { skipped: "not Monday morning" };
+  const owners = (await sb("profiles?select=id&role=eq.owner")) || [];
+  if (!owners.length) return { owners: 0 };
+  const since = new Date(Date.now() - 14 * 864e5).toISOString();
+  const rows = (await sb(`usage_events?select=kind,at&at=gte.${encodeURIComponent(since)}&kind=in.(${NEXT_KINDS.join(",")})&limit=20000`)) || [];
+  const payload = digestPayload(rows, Date.now());
+  let sent = 0, already = 0, noDevice = 0;
+  for (const o of owners) {
+    const subs = await subsFor(o.id);
+    if (!subs.length) { noDevice++; continue; }
+    // The guard row goes in first; ignore-duplicates + return=representation hands back
+    // only rows that were NEW, so an empty answer means this Monday was already sent.
+    const fresh = await sb("push_log", {
+      method: "POST",
+      headers: { Prefer: "resolution=ignore-duplicates,return=representation" },
+      body: JSON.stringify([{ lead_id: `weekly-${o.id}`, kind: "weekly", user_id: o.id, sent_on: today }]),
+    });
+    if (!Array.isArray(fresh) || !fresh.length) { already++; continue; }
+    const { counts, ...note } = payload;
+    const out = await sendTo(subs, note);
+    sent += out.sent;
+  }
+  return { owners: owners.length, sent, already, noDevice, counts: payload.counts };
+}
+
 // The debounce log is a debounce, not an archive. Trimmed once a day, on the first
 // sweep of that day — cheap, and nobody has to remember to run it.
 let _lastPrune = "";
@@ -239,6 +295,10 @@ router.post("/sweep", async (req, res) => {
   try {
     const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Johannesburg" }).format(new Date()); // YYYY-MM-DD
     await prunePushLog(today);
+    // Never lets a digest problem stop the follow-up alerts, which matter more.
+    let digest = null;
+    try { digest = await weeklyDigest(today, hour, !!(req.body && req.body.digest === "force")); }
+    catch (e) { digest = { error: e.message || "digest failed" }; console.warn("weekly digest failed", digest.error); }
     const rows = (await sb(`leads?select=id,agent_id,data`)) || [];
     const staleCutoff = STALE_DAYS > 0 ? Date.now() - STALE_DAYS * 864e5 : null;
 
@@ -253,7 +313,7 @@ router.post("/sweep", async (req, res) => {
       if (d.followUp && String(d.followUp) <= today) { items.push({ r, kind: "followup" }); return; }
       if (staleCutoff && Number(d.updatedAt) && Number(d.updatedAt) <= staleCutoff) items.push({ r, kind: "stale" });
     });
-    if (!items.length) return res.json({ ok: true, due: 0, sent: 0 });
+    if (!items.length) return res.json({ ok: true, due: 0, sent: 0, digest });
 
     // One notification per lead per REASON per day. The guard rows are written BEFORE
     // the send, so a crash mid-sweep can't produce a second round on the retry.
@@ -261,7 +321,7 @@ router.post("/sweep", async (req, res) => {
       ((await sb(`push_log?select=lead_id,kind&sent_on=eq.${today}`)) || []).map((r) => `${r.lead_id}|${r.kind}`)
     );
     const fresh = items.filter((it) => !logged.has(`${it.r.id}|${it.kind}`));
-    if (!fresh.length) return res.json({ ok: true, due: items.length, sent: 0, note: "all already notified today" });
+    if (!fresh.length) return res.json({ ok: true, due: items.length, sent: 0, note: "all already notified today", digest });
 
     const byAgent = {};
     fresh.forEach((it) => { (byAgent[it.r.agent_id] = byAgent[it.r.agent_id] || []).push(it); });
@@ -296,7 +356,7 @@ router.post("/sweep", async (req, res) => {
       due: items.length,
       followups: fresh.filter((i) => i.kind === "followup").length,
       stale: fresh.filter((i) => i.kind === "stale").length,
-      leadsNotified: notified, sent, pruned, held, maxPerAgent: MAX_PER_AGENT,
+      leadsNotified: notified, sent, pruned, held, maxPerAgent: MAX_PER_AGENT, digest,
     });
   } catch (e) {
     res.status(500).json({ error: e.message || "sweep failed" });
@@ -319,3 +379,4 @@ if (SWEEP_MS > 0 && SWEEP_SECRET) {
 }
 
 module.exports = router;
+module.exports._digestPayload = digestPayload;   // for tests only
