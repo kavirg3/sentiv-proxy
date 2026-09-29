@@ -150,7 +150,7 @@ router.get("/health", (_req, res) => {
     quietHours: `${QUIET_START}:00–${QUIET_END}:00 SAST`,
     staleDays: STALE_DAYS || "off",
     appUrl: APP_URL,
-    weeklyDigest: `Mondays from ${DIGEST_HOUR}:00 SAST — team numbers to the owner, own deals to each agent`,
+    weeklyDigest: `Mondays from ${DIGEST_HOUR}:00 SAST — team numbers to the owner, own deals to everyone`,
   });
 });
 
@@ -306,7 +306,9 @@ async function weeklyDigest(today, hour, force) {
 }
 
 async function agentDigests(today) {
-  const agents = (await sb("profiles?select=id&role=eq.agent")) || [];
+  // Owners too: on this team the owner works most of the deals, and the owner digest
+  // above is about the TEAM, not their own book. So they get both on a Monday.
+  const agents = (await sb("profiles?select=id&role=in.(agent,owner)")) || [];
   if (!agents.length) return { agents: 0 };
   // Only agents who can actually receive one are worth a leads read.
   const reachable = [];
