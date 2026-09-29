@@ -233,7 +233,23 @@ function digestPayload(rows, now) {
   const body = saved + T.next_done + T.next_ai === 0
     ? "No next steps were saved or completed last week. Worth a word with the team."
     : `AI wrote ${T.next_ai} line${T.next_ai === 1 ? "" : "s"} · agents saved ${saved} (${T.next_set_ai} from AI) · ${T.next_done} marked done. Saved ${trend}.`;
-  return { title: "Sentiv — last week's next steps", body, tag: "weekly-digest", url: `${APP_URL}/`, counts: { thisWeek: T, weekBefore: L } };
+  // v150 — the same summary as WhatsApp text, behind a "Send to WhatsApp" button (Hub
+  // v150 service worker). wa.me with no number opens the chat picker: the owner picks
+  // themselves or the team group, and their own WhatsApp sends it — no Meta API, no cost.
+  const wa = [
+    "*Sentiv — next steps, last 7 days*",
+    "",
+    `AI lines written: ${T.next_ai}`,
+    `Suggestions saved: ${saved} (${T.next_set_ai} from AI)`,
+    `Next actions done: ${T.next_done}`,
+    `Saved vs the week before: ${d === 0 ? "same" : `${d > 0 ? "up" : "down"} ${Math.abs(d)}`}`,
+  ].join("\n");
+  return {
+    title: "Sentiv — last week's next steps", body, tag: "weekly-digest", url: `${APP_URL}/`,
+    waUrl: `https://wa.me/?text=${encodeURIComponent(wa)}`,
+    actions: [{ action: "open", title: "Open Hub" }, { action: "wa", title: "Send to WhatsApp" }],
+    counts: { thisWeek: T, weekBefore: L },
+  };
 }
 
 // Each AGENT's own Monday note (Hub v148): their deals only, what needs doing this week,
@@ -273,6 +289,8 @@ function agentWeekPayload(leads, events, now, today) {
     body: todo + last,
     tag: "weekly-agent",
     url: `${APP_URL}/`,
+    // A weekly note is not a deal: "Open lead" / "Snooze" would both be wrong here.
+    actions: [{ action: "open", title: "Open Hub" }],
     counts: { open: open.length, overdue, due, cold, noNext, saved, done },
   };
 }
