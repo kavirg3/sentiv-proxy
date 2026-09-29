@@ -438,9 +438,13 @@ router.post("/sweep", async (req, res) => {
 
     // One notification per lead per REASON per day. The guard rows are written BEFORE
     // the send, so a crash mid-sweep can't produce a second round on the retry.
-    const logged = new Set(
-      ((await sb(`push_log?select=lead_id,kind&sent_on=eq.${today}`)) || []).map((r) => `${r.lead_id}|${r.kind}`)
-    );
+    const todayRows = (await sb(`push_log?select=lead_id,kind,user_id&sent_on=eq.${today}`)) || [];
+    const logged = new Set(todayRows.map((r) => `${r.lead_id}|${r.kind}`));
+    // Deal alerts ALREADY sent to each person today. The cap is per person per DAY: the
+    // sweep runs every 15 minutes, and capping each run alone let 5 more through every
+    // quarter hour — 90 buzzes to one Mac on 29/09/2026 against a cap of 5.
+    const sentToday = {};
+    todayRows.forEach((r) => { if (r.kind === "followup" || r.kind === "stale") sentToday[r.user_id] = (sentToday[r.user_id] || 0) + 1; });
     const fresh = items.filter((it) => !logged.has(`${it.r.id}|${it.kind}`));
     if (!fresh.length) return res.json({ ok: true, due: items.length, sent: 0, note: "all already notified today", digest });
 
@@ -454,8 +458,10 @@ router.post("/sweep", async (req, res) => {
     let held = 0;
     Object.keys(byAgent).forEach((agentId) => {
       const ranked = rankForAgent(byAgent[agentId]);
-      if (ranked.length > MAX_PER_AGENT) held += ranked.length - MAX_PER_AGENT;
-      byAgent[agentId] = ranked.slice(0, MAX_PER_AGENT);
+      const room = Math.max(0, MAX_PER_AGENT - (sentToday[agentId] || 0));
+      if (ranked.length > room) held += ranked.length - room;
+      byAgent[agentId] = ranked.slice(0, room);
+      if (!byAgent[agentId].length) delete byAgent[agentId];
     });
 
     let sent = 0, pruned = 0, notified = 0;
