@@ -17,7 +17,10 @@ const euph = http.createServer((req, res) => {
     res.end(`<?xml version='1.0'?><XML><Response>Originate ${ext} to ${to} with crmTag x</Response></XML>`);
   });
 });
+let ASSIGNED = null;   // team_settings.data.phoneExts, when a scenario sets it
 const sb = http.createServer((req, res) => {
+  if (req.url.startsWith("/rest/v1/team_settings")) { res.writeHead(200, { "Content-Type": "application/json" }); return res.end(JSON.stringify(ASSIGNED ? [{ data: { phoneExts: ASSIGNED } }] : [{ data: {} }])); }
+  if (req.url.startsWith("/rest/v1/user_state")) { res.writeHead(200, { "Content-Type": "application/json" }); return res.end("[]"); }
   const ok = req.url === "/auth/v1/user" && req.headers.authorization === "Bearer user-token" && req.headers.apikey === "service";
   res.writeHead(ok ? 200 : 401, { "Content-Type": "application/json" });
   res.end(JSON.stringify(ok ? { id: "6664924a-0ce3-4125-8343-b6c9183e3549" } : { msg: "bad jwt" }));
@@ -106,6 +109,22 @@ async function boot(port, env) {
     const h5 = await (await fetch("http://127.0.0.1:4815/api/euphoria/health")).json();
     check("a whole SIP username is read as the tenant", h5.tenantName === "sentiv", JSON.stringify(h5));
     s5.p.kill();
+  }
+  // 6. The owner has assigned extensions: a call may only ring the caller's own.
+  {
+    ASSIGNED = { "6664924a-0ce3-4125-8343-b6c9183e3549": "100", "someone-else": "101" };
+    const s6 = await boot(4816, { ...base, EUPHORIA_API_KEY: "good-key", EUPHORIA_TENANT: "FutureLifeTech" });
+    let r6 = await post(4816, { extension: "101", number: "0825550111" }, "user-token");
+    check("assigned: ringing a colleague's extension is refused", r6.status === 403 && /Your extension is 100/.test(r6.body.error), JSON.stringify(r6));
+    r6 = await post(4816, { extension: "100", number: "0825550111" }, "user-token");
+    check("assigned: ringing your own extension works", r6.status === 200, JSON.stringify(r6));
+    s6.p.kill();
+    ASSIGNED = { "someone-else": "101" };
+    const s7 = await boot(4817, { ...base, EUPHORIA_API_KEY: "good-key", EUPHORIA_TENANT: "FutureLifeTech" });
+    const r7 = await post(4817, { extension: "100", number: "0825550111" }, "user-token");
+    check("assigned to others but not you: refused with a plain reason", r7.status === 403 && /ask the owner/.test(r7.body.error), JSON.stringify(r7));
+    s7.p.kill();
+    ASSIGNED = null;
   }
   euph.close(); sb.close();
   console.log(fails.length ? `\n${fails.length} FAILED` : "\nALL PASS");

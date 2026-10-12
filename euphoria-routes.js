@@ -111,7 +111,16 @@ async function originate(req, res) {
   const user = await userFromToken(req);
   if (!user) return res.status(401).json({ error: "Sign in again to call from the Hub." });
   const ext = ourExtension(extension);
-  if (!ext) return res.status(400).json({ error: `"${String(extension).slice(0, 20)}" isn't an extension on our phone system — use the number only, e.g. 108.` });
+  if (!ext) return res.status(400).json({ error: `"${String(extension).slice(0, 20)}" isn't an extension on our phone system — use the number only, e.g. 100.` });
+  // Once the owner assigns extensions, a call can only ring YOUR assigned extension.
+  try {
+    const map = await extMap();
+    if (map.assigned) {
+      const mineExt = map.byUser[user.id];
+      if (!mineExt) return res.status(403).json({ error: "No phone extension is assigned to you yet — ask the owner to set it on the Team tab." });
+      if (ext.split("-")[0] !== mineExt) return res.status(403).json({ error: `Your extension is ${mineExt}. Calls can only ring your own phone.` });
+    }
+  } catch (e) { return res.status(502).json({ error: "Couldn't check your extension — try again." }); }
   const dial = saNumber(number);
   if (!dial) return res.status(400).json({ error: "Only South African numbers can be dialled from the Hub." });
   const limited = overLimit(user.id);
@@ -184,19 +193,26 @@ async function sbGet(path) {
 }
 const digitsExt = (v) => { const m = String(v == null ? "" : v).trim().match(/^(\d{2,6})(?:-[A-Za-z0-9_]+)?$/); return m ? m[1] : ""; };
 
-let _extCache = { at: 0, byUser: {}, byExt: {} };
+// v218 — the OWNER assigns extensions (team_settings.data.phoneExts, an owner-write row).
+// Once any assignment exists it is the only source: what an agent typed into their own box
+// is ignored, so nobody can claim a colleague's extension and read their calls. Before the
+// owner has assigned anyone, the agents' own entries still count (the v216 behaviour).
+let _extCache = { at: 0, byUser: {}, byExt: {}, assigned: false };
 async function extMap() {
   if (Date.now() - _extCache.at < 60e3) return _extCache;
-  const rows = await sbGet("user_state?id=eq.euphoriaExt&select=agent_id,data");
   const claims = {};
-  rows.forEach((r) => {
-    const v = r && r.data && typeof r.data === "object" && "v" in r.data ? r.data.v : r && r.data;
-    const ext = digitsExt(v);
-    if (ext) (claims[ext] = claims[ext] || []).push(r.agent_id);
-  });
+  const claim = (uid, v) => { const ext = digitsExt(v); if (uid && ext) (claims[ext] = claims[ext] || []).push(uid); };
+  const ts = await sbGet("team_settings?id=eq.1&select=data").catch(() => []);
+  const owned = ts && ts[0] && ts[0].data && ts[0].data.phoneExts;
+  const assigned = !!(owned && typeof owned === "object" && Object.values(owned).some((v) => digitsExt(v)));
+  if (assigned) Object.entries(owned).forEach(([uid, v]) => claim(uid, v));
+  else {
+    const rows = await sbGet("user_state?id=eq.euphoriaExt&select=agent_id,data");
+    rows.forEach((r) => claim(r && r.agent_id, r && r.data && typeof r.data === "object" && "v" in r.data ? r.data.v : r && r.data));
+  }
   const byUser = {}, byExt = {};
   Object.entries(claims).forEach(([ext, ids]) => { if (ids.length === 1) { byExt[ext] = ids[0]; byUser[ids[0]] = ext; } });
-  _extCache = { at: Date.now(), byUser, byExt };
+  _extCache = { at: Date.now(), byUser, byExt, assigned };
   return _extCache;
 }
 async function roleOf(uid) {

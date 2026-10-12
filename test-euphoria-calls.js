@@ -41,11 +41,13 @@ const euph = http.createServer((req, res) => {
   });
 });
 // user_state: Kavir 100, Faraad 101, two people both claim 102
+let ASSIGN = null;
 const sb = http.createServer((req, res) => {
   const tok = (req.headers.authorization || "").replace("Bearer ", "");
   res.setHeader("Content-Type", "application/json");
   if (req.url === "/auth/v1/user") { const id = TOKENS[tok]; res.writeHead(id ? 200 : 401); return res.end(JSON.stringify(id ? { id } : {})); }
   if (tok !== "service") { res.writeHead(401); return res.end("[]"); }
+  if (req.url.startsWith("/rest/v1/team_settings")) return res.end(JSON.stringify([{ data: ASSIGN ? { phoneExts: ASSIGN } : {} }]));
   if (req.url.startsWith("/rest/v1/user_state")) return res.end(JSON.stringify([
     { agent_id: OWNER, data: { v: "100", at: 1, id: "euphoriaExt" } },
     { agent_id: AGENT, data: { v: "101-FutureLifeTech", at: 1, id: "euphoriaExt" } },
@@ -139,6 +141,21 @@ async function boot(port, env) {
   check("no AssemblyAI key → 501 with a plain reason", r2.status === 501);
   s2.p.kill();
 
+  // v218: the owner assigns. THIEF typed 102 into their own box; the owner gave 102 to
+  // Faraad instead and moved Kavir to 101 — self-claims no longer count at all.
+  ASSIGN = { [OWNER]: "101", [AGENT]: "102" };
+  const s3 = await boot(4823, env);
+  const B3 = "http://127.0.0.1:4823/api/euphoria";
+  const g3 = async (u, tok) => { const r = await fetch(B3 + u, { headers: { Authorization: `Bearer ${tok}` } }); return { status: r.status, body: await r.json() }; };
+  let a = await g3("/calls?days=3", "agent-tok");
+  check("assigned: Faraad now sees ext 102's calls, not his typed 101", a.body.ext === "102" && a.body.calls.map((c) => c.id).join(",") === "505", JSON.stringify(a.body).slice(0, 200));
+  a = await g3("/calls?days=3", "thief-tok");
+  check("assigned: someone who only TYPED an extension gets nothing", a.body.calls.length === 0 && a.body.needsExtension === true);
+  a = await g3("/calls?days=3", "owner-tok");
+  const by3 = Object.fromEntries((a.body.calls || []).map((c) => [c.id, c.agentId]));
+  check("assigned: owner's table attributes by assignment", by3["503"] === OWNER && by3["505"] === AGENT && by3["501"] === null, JSON.stringify(by3));
+  s3.p.kill();
+  ASSIGN = null;
   euph.close(); sb.close(); aai.close();
   console.log(fails.length ? `\n${fails.length} FAILED` : "\nALL PASS");
   process.exit(fails.length ? 1 : 0);
