@@ -28,8 +28,11 @@ const express = require("express");
 const router = express.Router();
 
 const API_URL = process.env.EUPHORIA_API_URL || "https://api.euphoria.co.za/files/1010107057/api/Euphoria.Api.aspx";
-const KEY = () => process.env.EUPHORIA_API_KEY || "";
-const TENANT = () => (process.env.EUPHORIA_TENANT || process.env.EUPHORIA_ORG_ID || "").trim();
+// Trimmed, quotes stripped: a key pasted with a trailing newline or wrapped in quotes is
+// rejected by Euphoria as "Authorization Failed", which looks exactly like a wrong key.
+const clean = (v) => String(v || "").trim().replace(/^["']|["']$/g, "").trim();
+const KEY = () => clean(process.env.EUPHORIA_API_KEY);
+const TENANT = () => clean(process.env.EUPHORIA_TENANT || process.env.EUPHORIA_ORG_ID);
 const SB_URL = () => (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
 const SB_SERVICE = () => process.env.SUPABASE_SERVICE_KEY || "";
 const PER_MIN = Number(process.env.EUPHORIA_MAX_PER_MIN) || 6;
@@ -122,7 +125,10 @@ async function originate(req, res) {
 // GET /api/euphoria/health — is the key set, and does Euphoria accept it? Uses the
 // DoNothing action, which dials nothing. Returns no secrets.
 router.get("/health", async (_req, res) => {
-  const cfg = { key: !!KEY(), tenant: !!TENANT(), supabase: !!(SB_URL() && SB_SERVICE()) };
+  // The tenant name is not a secret (it is half of every SIP username), so it is shown to make
+  // a typo visible. The key never is: only its length and whether the raw value needed cleaning.
+  const raw = process.env.EUPHORIA_API_KEY || "";
+  const cfg = { key: !!KEY(), tenant: !!TENANT(), tenantName: TENANT(), keyLength: KEY().length, keyWasCleaned: raw !== KEY(), supabase: !!(SB_URL() && SB_SERVICE()) };
   if (!cfg.key || !cfg.tenant) return res.json({ ok: false, ...cfg, auth: "not configured" });
   try {
     const out = await euphoria("DoNothing");
