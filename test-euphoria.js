@@ -101,6 +101,12 @@ async function boot(port, env) {
     check("EUPHORIA_ORG_ID accepted as the tenant", h4.ok === true);
     s4.p.kill();
   }
+  {
+    const s5 = await boot(4815, { ...base, EUPHORIA_API_KEY: "good-key", EUPHORIA_TENANT: "100-sentiv" });
+    const h5 = await (await fetch("http://127.0.0.1:4815/api/euphoria/health")).json();
+    check("a whole SIP username is read as the tenant", h5.tenantName === "sentiv", JSON.stringify(h5));
+    s5.p.kill();
+  }
   euph.close(); sb.close();
   console.log(fails.length ? `\n${fails.length} FAILED` : "\nALL PASS");
   process.exit(fails.length ? 1 : 0);

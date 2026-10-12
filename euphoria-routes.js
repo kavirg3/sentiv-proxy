@@ -32,7 +32,8 @@ const API_URL = process.env.EUPHORIA_API_URL || "https://api.euphoria.co.za/file
 // rejected by Euphoria as "Authorization Failed", which looks exactly like a wrong key.
 const clean = (v) => String(v || "").trim().replace(/^["']|["']$/g, "").trim();
 const KEY = () => clean(process.env.EUPHORIA_API_KEY);
-const TENANT = () => clean(process.env.EUPHORIA_TENANT || process.env.EUPHORIA_ORG_ID);
+// A whole SIP username ("100-sentiv") is accepted too: the tenant is the part after the dash.
+const TENANT = () => clean(process.env.EUPHORIA_TENANT || process.env.EUPHORIA_ORG_ID).replace(/^\d{2,6}-/, "");
 const SB_URL = () => (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
 const SB_SERVICE = () => process.env.SUPABASE_SERVICE_KEY || "";
 const PER_MIN = Number(process.env.EUPHORIA_MAX_PER_MIN) || 6;
