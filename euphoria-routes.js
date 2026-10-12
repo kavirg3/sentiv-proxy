@@ -126,6 +126,18 @@ async function originate(req, res) {
   }
 }
 
+// Can recordings be turned into something a browser plays? Checked once, with a real
+// conversion of a tiny silent WAV, because "the binary exists" is not "it runs here".
+let _mp3ok = null;
+async function canMp3() {
+  if (_mp3ok !== null) return _mp3ok;
+  const n = 800, buf = Buffer.alloc(44 + n * 2);
+  buf.write("RIFF", 0); buf.writeUInt32LE(36 + n * 2, 4); buf.write("WAVEfmt ", 8); buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20); buf.writeUInt16LE(1, 22); buf.writeUInt32LE(8000, 24); buf.writeUInt32LE(16000, 28);
+  buf.writeUInt16LE(2, 32); buf.writeUInt16LE(16, 34); buf.write("data", 36); buf.writeUInt32LE(n * 2, 40);
+  _mp3ok = !!(await toMp3(buf));
+  return _mp3ok;
+}
 // GET /api/euphoria/health — is the key set, and does Euphoria accept it? Uses the
 // DoNothing action, which dials nothing. Returns no secrets.
 router.get("/health", async (_req, res) => {
@@ -136,7 +148,7 @@ router.get("/health", async (_req, res) => {
   if (!cfg.key || !cfg.tenant) return res.json({ ok: false, ...cfg, auth: "not configured" });
   try {
     const out = await euphoria("DoNothing");
-    res.json({ ok: out.ok && cfg.supabase, ...cfg, stt: !!AAI_KEY(), auth: out.ok ? "accepted" : out.error });
+    res.json({ ok: out.ok && cfg.supabase, ...cfg, stt: !!AAI_KEY(), mp3: await canMp3(), auth: out.ok ? "accepted" : out.error });
   } catch (e) {
     res.json({ ok: false, ...cfg, auth: `unreachable: ${e.message}` });
   }
