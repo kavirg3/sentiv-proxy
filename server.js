@@ -49,18 +49,11 @@ app.use("/api/whatsapp", require("./whatsapp-routes"));
 app.use("/api/push", require("./push-routes"));
 
 // ---- Euphoria click-to-dial: rings the agent's extension, then the client ----
-// App sends: { extension, number, company }
-app.post("/api/euphoria-originate", async (req, res) => {
-  const { extension, number } = req.body || {};
-  if (need(res, { extension, number })) return;
-  const key = envOr400(res, "EUPHORIA_API_KEY"); if (!key) return;
-  const org = envOr400(res, "EUPHORIA_ORG_ID"); if (!org) return;
-  await upstream(res, "https://api.euphoria.co.za/api/v1/originate", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
-    body: JSON.stringify({ organisation: org, extension: String(extension), destination: String(number).replace(/\s+/g, "") }),
-  }, "Euphoria");
-});
+// App sends: { extension, number, company } with the agent's Supabase token.
+// Signed-in users only, SA numbers only — see euphoria-routes.js.
+const euphoriaRoutes = require("./euphoria-routes");
+app.post("/api/euphoria-originate", euphoriaRoutes.originate);
+app.use("/api/euphoria", euphoriaRoutes.router);
 
 // ---- VBOUT: add/refresh a contact on a list (partners + nurture) ----
 // App sends: { email, firstName, lastName, phone, listId, tags }
