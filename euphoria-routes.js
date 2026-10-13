@@ -49,7 +49,10 @@ async function euphoria(action, fields = {}) {
     + Object.entries(fields).map(([k, v]) => `<${k}>${esc(v)}</${k}>`).join("")
     + "</XML>";
   const r = await fetch(API_URL, { method: "POST", headers: { "Content-Type": "text/xml; charset=utf-8" }, body });
-  const text = await r.text();
+  // Live replies wrap every value in CDATA (<uID><![CDATA[118389741]]></uID>) — not in the
+  // docs. Unwrap it, escaping what was inside, so a CallerID like "Name" <+2721…> cannot
+  // break the parse. Found 13 Oct 2026: before this, 15 real calls parsed as 0.
+  const text = (await r.text()).replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (_, v) => v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"));
   if (!r.ok) return { ok: false, error: `Euphoria answered HTTP ${r.status}` };
   // Only a TOP-LEVEL <Status>/<Error> means the request failed. A call-record list has a
   // <Status> per call (ANSWERED, NO ANSWER, FAILED…) that must not be mistaken for one.
@@ -294,7 +297,7 @@ async function fetchCdrs({ days, ext }) {
     // The list wrapper isn't documented. If a reply has content but no call parsed out of
     // it, log its SHAPE (tag names only, no values, so no numbers) to fix the parser by.
     if (!rows.length && page === 0 && String(res.raw || "").length > 120) {
-      console.log(`[euphoria] cdr shape: ${String(res.raw).replace(/>[^<]*</g, "><").slice(0, 400)}`);
+      console.log(`[euphoria] cdr shape: ${String(res.raw).replace(/>[^<]*</g, "><").replace(/\d{4,}/g, "#").slice(0, 400)}`);
     }
     out.push(...rows);
     if (rows.length < 500) break;
@@ -311,7 +314,9 @@ async function cdrsCached(days, ext) {
   // One line per real fetch — counts and statuses only, never a number — so "no calls
   // showed up" can be told apart from "Euphoria sent calls we could not read".
   const tally = {}; rows.forEach((r) => { const k = String(r.Status || "?").toUpperCase(); tally[k] = (tally[k] || 0) + 1; });
-  console.log(`[euphoria] cdrs days=${days} ext=${ext || "all"} rows=${rows.length} ${JSON.stringify(tally)}`);
+  const mask = (v) => String(v || "").replace(/\d{5,}/g, "#");
+  const r0 = rows[0] || {};
+  console.log(`[euphoria] cdrs days=${days} ext=${ext || "all"} rows=${rows.length} ${JSON.stringify(tally)} first: ch=${mask(r0.ChannelID)} dch=${mask(r0.DestChannel)} app=${mask(r0.LastApp)} src=${/^\d{2,6}$/.test(r0.Source || "") ? r0.Source : "ext?no"} dst=${/^\d{2,6}$|^PJ/.test(r0.Destination || "") ? r0.Destination : "ext?no"}`);
   _callCache.set(key, { at: Date.now(), rows });
   if (_callCache.size > 50) _callCache.delete(_callCache.keys().next().value);
   return rows;
@@ -331,9 +336,24 @@ router.get("/calls", async (req, res) => {
     const days = Math.max(1, Math.min(90, Number(req.query.days) || 3));
     const mine = String(req.query.mine || "") === "1";
     if ((!g.owner || mine) && !g.ext) return res.json({ calls: [], ext: "", owner: g.owner, needsExtension: true });
-    const rows = await cdrsCached(days, g.owner && !mine ? "" : g.ext);
-    let calls = rows.map((r) => shapeCall(r, g.map)).filter((c) => c.at && c.dir !== "internal");
-    if (!g.owner || mine) calls = calls.filter((c) => c.ext === g.ext);
+    // Always ask Euphoria per extension and trust its filter. A call placed from the Hub
+    // shows the company number as Source and the client as Destination, with no extension
+    // in either, so the extension can't always be read back off the record itself.
+    const exts = g.owner && !mine ? Object.keys(g.map.byExt) : [g.ext];
+    const seen = new Set();
+    let calls = [];
+    for (const ext of exts) {
+      const rows = await cdrsCached(days, ext);
+      rows.forEach((r) => {
+        if (seen.has(String(r.uID))) return;
+        const c = shapeCall(r, g.map);
+        if (c.ext && c.ext !== ext) return;              // the other end of an internal call
+        seen.add(String(r.uID));
+        if (!c.ext) { c.ext = ext; c.agentId = g.map.byExt[ext] || null; if (c.dir === "unknown") c.dir = "out"; }
+        calls.push(c);
+      });
+    }
+    calls = calls.filter((c) => c.at && c.dir !== "internal");
     calls.sort((a, b) => (a.at < b.at ? 1 : -1));
     res.json({ calls: calls.slice(0, 5000), ext: g.ext, owner: g.owner, stt: !!AAI_KEY() });
   } catch (e) { res.status(502).json({ error: `Euphoria: ${e.message}` }); }
