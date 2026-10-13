@@ -47,6 +47,7 @@ app.use("/api/kuration", require("./kuration-routes"));
 app.use("/api/pcloud", require("./pcloud-routes"));
 app.use("/api/whatsapp", require("./whatsapp-routes"));
 app.use("/api/push", require("./push-routes"));
+app.use("/api/team", require("./team-routes"));   // owner invites that survive email link-scanners
 
 // ---- Euphoria click-to-dial: rings the agent's extension, then the client ----
 // App sends: { extension, number, company } with the agent's Supabase token.
