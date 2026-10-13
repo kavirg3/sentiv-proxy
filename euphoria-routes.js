@@ -104,6 +104,9 @@ function overLimit(uid) {
 // Order matters for the Hub's diagnostics probe, which POSTs {} with no token:
 // 500 "not configured" = key missing, 400 "missing" = route alive and configured.
 async function originate(req, res) {
+  // Log every refusal's reason (never the number) so a failed Call button can be diagnosed.
+  const _json = res.json.bind(res);
+  res.json = (body) => { if (res.statusCode >= 400 && body && body.error) console.log(`[euphoria] originate refused ${res.statusCode}: ${String(body.error).replace(/\d{6,}/g, "***")}`); return _json(body); };
   if (!KEY() || !TENANT()) return res.status(500).json({ error: "EUPHORIA_API_KEY / EUPHORIA_TENANT not configured on the server" });
   const { extension, number, company } = req.body || {};
   const missing = [!extension && "extension", !number && "number"].filter(Boolean);
@@ -305,6 +308,10 @@ async function cdrsCached(days, ext) {
   const hit = _callCache.get(key);
   if (hit && Date.now() - hit.at < 60e3) return hit.rows;
   const rows = await fetchCdrs({ days, ext });
+  // One line per real fetch — counts and statuses only, never a number — so "no calls
+  // showed up" can be told apart from "Euphoria sent calls we could not read".
+  const tally = {}; rows.forEach((r) => { const k = String(r.Status || "?").toUpperCase(); tally[k] = (tally[k] || 0) + 1; });
+  console.log(`[euphoria] cdrs days=${days} ext=${ext || "all"} rows=${rows.length} ${JSON.stringify(tally)}`);
   _callCache.set(key, { at: Date.now(), rows });
   if (_callCache.size > 50) _callCache.delete(_callCache.keys().next().value);
   return rows;
