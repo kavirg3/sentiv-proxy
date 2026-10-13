@@ -1,0 +1,22 @@
+# Sentiv Hub daily health check — 06:00 SAST (04:00 UTC) every day.
+# Runs health-check.js against the LIVE Hub, proxy and database using only public access.
+# If anything is broken the run fails and GitHub emails the repo owner. Nothing to set up.
+# Run it by hand any time: GitHub → Actions → "Sentiv Hub daily health" → Run workflow.
+name: Sentiv Hub daily health
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Check the live Hub, proxy and database
+        run: node health-check.js
