@@ -39,6 +39,52 @@ app.get("/health", (_req, res) => res.json({
   routes: ["anthropic", "euphoria", "vbout", "manyreach", "repliq", "pcloud", "whatsapp", "kuration", "push"],
 }));
 
+// ---- Sign-in gate (14 Oct 2026) ----------------------------------------------
+// Every /api route now needs a signed-in Sentiv user. Until this, the Vault (pCloud) and
+// the AI route answered ANYONE who knew this server's address — company files listable
+// and the Anthropic key usable on our bill — and since v219 that address is in the
+// public page. The only routes left open are ones that are protected another way or
+// carry nothing: inbound webhooks (verified by HMAC signature), the reminder sweep
+// (shared secret), and the status checks the Hub's diagnostics read.
+const PUBLIC_ROUTES = [
+  ["GET", /^\/api\/push\/key$/],            // VAPID PUBLIC key — public by definition
+  ["GET", /^\/api\/push\/health$/],
+  ["POST", /^\/api\/push\/sweep$/],          // x-sweep-secret
+  ["GET", /^\/api\/kuration\/health$/],
+  ["POST", /^\/api\/kuration\/webhook$/],    // HMAC over the raw body
+  ["GET", /^\/api\/whatsapp\/health$/],
+  ["GET", /^\/api\/whatsapp\/webhook$/],     // Meta's verify-token handshake
+  ["POST", /^\/api\/whatsapp\/webhook$/],    // HMAC over the raw body
+  ["GET", /^\/api\/euphoria\/health$/],
+];
+const _tokCache = new Map();   // token -> { uid, until }
+async function signedInUser(req) {
+  const token = (req.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
+  if (!token) return null;
+  const hit = _tokCache.get(token);
+  if (hit && hit.until > Date.now()) return hit.uid;
+  const SB = (process.env.SUPABASE_URL || "").replace(/\/+$/, ""), SVC = process.env.SUPABASE_SERVICE_KEY || "";
+  if (!SB || !SVC) return null;
+  try {
+    const r = await fetch(`${SB}/auth/v1/user`, { headers: { apikey: SVC, Authorization: `Bearer ${token}` } });
+    if (!r.ok) return null;
+    const u = await r.json();
+    if (!u || !u.id) return null;
+    _tokCache.set(token, { uid: u.id, until: Date.now() + 60e3 });   // a revoked session stops within a minute
+    if (_tokCache.size > 500) _tokCache.delete(_tokCache.keys().next().value);
+    return u.id;
+  } catch (e) { return null; }
+}
+app.use("/api", async (req, res, next) => {
+  if (req.method === "OPTIONS") return next();
+  const full = req.baseUrl + req.path;
+  if (PUBLIC_ROUTES.some(([m, re]) => m === req.method && re.test(full))) return next();
+  const uid = await signedInUser(req);
+  if (!uid) return res.status(401).json({ error: "Sign in to the Sentiv Hub first." });
+  req.sentivUser = uid;
+  next();
+});
+
 // ---- Mounted route modules -------------------------------------------------
 // Each one fails closed: without its environment variables it answers with a clear
 // "not configured" error rather than half-working. Mounting them costs nothing.

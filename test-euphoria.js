@@ -46,7 +46,7 @@ async function boot(port, env) {
   // 1. Not configured
   {
     const s = await boot(4811, base);
-    const r = await post(4811, {});
+    const r = await post(4811, {}, "user-token");   // 14 Oct: unsigned calls now stop at the sign-in gate
     check("no key: diagnostics probe gets 500 not configured", r.status === 500 && /not configured/.test(r.body.error), JSON.stringify(r));
     const h = await (await fetch("http://127.0.0.1:4811/api/euphoria/health")).json();
     check("no key: health says not configured", h.ok === false && h.key === false && h.auth === "not configured");
@@ -54,10 +54,10 @@ async function boot(port, env) {
   }
   // 2. Configured with the right key
   const s = await boot(4812, { ...base, EUPHORIA_API_KEY: "good-key", EUPHORIA_TENANT: "sentiv" });
-  let r = await post(4812, {});
-  check("diagnostics probe ({} no token) gets 400 missing", r.status === 400 && /missing/.test(r.body.error));
+  let r = await post(4812, {}, "user-token");
+  check("diagnostics probe ({} signed in) gets 400 missing", r.status === 400 && /missing/.test(r.body.error));
   r = await post(4812, { extension: "108", number: "0825550111" });
-  check("no sign-in: refused 401, nothing sent to Euphoria", r.status === 401 && !seen.some((x) => x.body.includes("Originate")), JSON.stringify(r));
+  check("no sign-in: refused 401 (at the gate), nothing sent to Euphoria", r.status === 401 && !seen.some((x) => x.body.includes("Originate")), JSON.stringify(r));
   r = await post(4812, { extension: "108", number: "0825550111" }, "stolen-token");
   check("bad token: refused 401", r.status === 401);
   r = await post(4812, { extension: "108", number: "+27 82 555 0111", company: "Acme <&> Ltd" }, "user-token");
