@@ -37,7 +37,10 @@ const euph = http.createServer((req, res) => {
       const list = CDRS.filter((c) => !ext || c.forExt === ext || c.ch.includes(`/${ext}-`) || (c.dch || "").includes(`/${ext}-`));
       return res.end(`<?xml version='1.0'?><XML>${list.map(rec).join("")}</XML>`);
     }
-    if (act === "DownloadCallRecordingByCdrID") { downloads++; return res.end(`<?xml version='1.0'?><XML><audioData>${cd(WAV.toString("base64"))}</audioData></XML>`); }
+    // Like live (16 Oct 2026): <cdrID> → "Api Service Error". This fake only answers the filename
+    // form, with the audio in an undocumented tag, so the fallbacks are what gets exercised.
+    if (act === "DownloadCallRecordingByCdrID") return res.end("<?xml version='1.0'?><XML><Status>Failed</Status><Error>Api Service Error</Error></XML>");
+    if (act === "DownloadCallRecordingByFilename" && f("filename")) { downloads++; return res.end(`<?xml version='1.0'?><XML><Status>Success</Status><Data>${cd(WAV.toString("base64"))}</Data></XML>`); }
     res.end("<XML><Response>ok</Response></XML>");
   });
 });
@@ -250,6 +253,8 @@ const filesUnder = (agent) => { const a = kids(byPath("Sentiv Call Recordings") 
   check("self-test file cleaned up", kids(kids(root).find((n) => n.name === "_selftest").id).length === 0);
   check("the Vault was never written to", kids(VAULT).length === 2);
   check("pCloud never saw a request without the token", pcAuthBad === 0);
+  check("recordings found via the fallback, and the log says which way", /recordings download via DownloadCallRecordingByFilename <filename>/.test(s.log()), (s.log().match(/\[euphoria\] recording[^\n]*/) || [""])[0]);
+  check("the working way is remembered (logged once)", (s.log().match(/recordings download via/g) || []).length === 1);
   check("no phone numbers in the server log", !/0825550123|0725550199|0825550111/.test(s.log()), "");
   s.p.kill();
 

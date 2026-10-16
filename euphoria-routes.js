@@ -262,7 +262,14 @@ function extFromChannel(ch) {
 // StartTime is South African local time with no zone ("2026-10-12 09:40:00").
 const sastIso = (t) => { const m = String(t || "").match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2})?)/); return m ? new Date(`${m[1]}T${m[2].length === 5 ? m[2] + ":00" : m[2]}+02:00`).toISOString() : null; };
 
+// Server-side only: the PBX's own names for a call's recording, for the download fallbacks
+// in audioFor(). Never sent to the browser.
+const _recRefs = new Map();   // uID -> { file, unique }
 function shapeCall(r, map) {
+  if (r && r.uID && (r.RecordingFilename || r.UniqueID)) {
+    _recRefs.set(String(r.uID), { file: unxml(r.RecordingFilename), unique: unxml(r.UniqueID) });
+    if (_recRefs.size > 20000) _recRefs.delete(_recRefs.keys().next().value);
+  }
   const src = normNumber(r.Source), dst = normNumber(r.Destination);
   const isExt = (n) => /^\d{2,6}$/.test(n);
   let ext = "", other = "", dir = "";
@@ -371,12 +378,47 @@ async function ownedCall(g, id) {
   return call;
 }
 
+// Euphoria's docs give no input fields for the recording downloads, and the first guess
+// (<cdrID>) answers "Api Service Error" on live calls (16 Oct 2026) — while GetCdrDetails
+// takes <CdrID>. So try the likely shapes in order, remember the one that works, and log
+// which it was (never the number or file name).
+const REC_WAYS = [
+  ["DownloadCallRecordingByCdrID", (id) => ({ CdrID: id })],
+  ["DownloadCallRecordingByCdrID", (id) => ({ cdrID: id })],
+  ["DownloadCallRecordingByCdrID", (id) => ({ cdrId: id })],
+  ["DownloadCallRecordingByFilename", (id, ref) => ref.file && ({ filename: ref.file })],
+  ["DownloadCallRecordingByFilename", (id, ref) => ref.file && ({ fileName: ref.file })],
+  ["DownloadCallRecordingByUniqueId", (id, ref) => ref.unique && ({ uniqueId: ref.unique })],
+  ["DownloadCallRecordingByUniqueId", (id, ref) => ref.unique && ({ UniqueID: ref.unique })],
+];
+let _recWay = -1;
+// The audio may sit in <audioData> or another tag: take the biggest base64 block in the reply.
+function audioB64(raw) {
+  const named = tag(raw, "audioData");
+  if (named) return named;
+  let best = "";
+  for (const m of String(raw).matchAll(/>([A-Za-z0-9+/=\s]{400,})</g)) if (m[1].length > best.length) best = m[1];
+  return best.replace(/\s+/g, "");
+}
 async function audioFor(id) {
-  const a = await euphoria("DownloadCallRecordingByCdrID", { cdrID: id });
-  if (!a.ok) throw new Error(a.error);
-  const b64 = tag(a.raw, "audioData");
-  if (!b64) throw new Error("no recording on this call");
-  return Buffer.from(b64, "base64");
+  const ref = _recRefs.get(String(id)) || {};
+  const order = _recWay >= 0 ? [_recWay, ...REC_WAYS.keys()].filter((v, i, a) => a.indexOf(v) === i) : [...REC_WAYS.keys()];
+  const tried = [];
+  for (const i of order) {
+    const [action, fields] = REC_WAYS[i];
+    const f = fields(id, ref);
+    if (!f) continue;
+    const a = await euphoria(action, f);
+    const b64 = a.ok ? audioB64(a.raw) : "";
+    if (b64) {
+      if (_recWay !== i) console.log(`[euphoria] recordings download via ${action} <${Object.keys(f)[0]}>`);
+      _recWay = i;
+      return Buffer.from(b64, "base64");
+    }
+    tried.push(`${action}<${Object.keys(f)[0]}>: ${a.ok ? `no audio (${String(a.raw).replace(/>[^<]*</g, "><").slice(0, 120)})` : a.error}`);
+  }
+  console.log(`[euphoria] recording download failed — ${tried.join(" | ").replace(/\d{6,}/g, "***")}`);
+  throw new Error(tried.length ? tried[tried.length - 1].split(": ").slice(1).join(": ") || "no recording on this call" : "no recording on this call");
 }
 // Euphoria's WAVs are GSM-compressed, which no browser plays. ffmpeg turns them into MP3;
 // if ffmpeg is missing, the original WAV is sent and the Hub offers it as a download.
