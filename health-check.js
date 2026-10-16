@@ -46,7 +46,7 @@ async function proxy() {
   const closed = [["POST", "/api/pcloud/list"], ["POST", "/api/pcloud/fetch"], ["POST", "/api/anthropic"], ["GET", "/api/kuration/projects"],
     ["POST", "/api/kuration/rows"], ["POST", "/api/team/invite"], ["GET", "/api/euphoria/calls"], ["POST", "/api/euphoria-originate"],
     ["POST", "/api/vbout-contact"], ["POST", "/api/manyreach-enroll"], ["POST", "/api/repliq-generate"], ["POST", "/api/push/test"],
-    ["POST", "/api/euphoria/archive/sync"], ["GET", "/api/euphoria/archive/play/1"]];
+    ["POST", "/api/euphoria/archive/sync"], ["GET", "/api/euphoria/archive/play/1"], ["GET", "/api/euphoria/archive/list"]];
   for (const [m, p] of closed) {
     const r = await get(`${PROXY}${p}`, { method: m, headers: { "Content-Type": "application/json" }, body: m === "GET" ? undefined : "{}" });
     check("Server lock", `${m} ${p} refuses strangers`, r.status === 401, `HTTP ${r.status}`);

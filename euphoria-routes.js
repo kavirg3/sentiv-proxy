@@ -517,6 +517,8 @@ router.get("/transcribe/job/:job", async (req, res) => {
 //
 // POST /api/euphoria/archive/sync        signed in. An agent archives their own extension's
 //      calls; the owner archives everyone's. → { files: { uID: fileid }, uploaded, pending }
+// GET  /api/euphoria/archive/list?days=30   signed in. Every recorded, answered call (Euphoria
+//      records + pCloud copies), newest first — own calls only, the owner everyone's.
 // GET  /api/euphoria/archive/play/:fileid  signed in. audio/mpeg — only for the agent the
 //      call belongs to, or the owner. Works after Euphoria has deleted the call.
 // POST /api/euphoria/archive/sweep       Daily, from GitHub Actions, which proves itself with
@@ -719,6 +721,75 @@ router.get("/archive/play/:fileid", async (req, res) => {
     res.type(who.name.endsWith(".mp3") ? "audio/mpeg" : "audio/wav");
     res.send(buf);
   } catch (e) { sendErr(res, e, "Recording"); }
+});
+
+// GET /api/euphoria/archive/list?days=30 — the Hub's Calls page (v238): every recorded,
+// answered call in one list, newest first, whether or not it matched a deal. Two sources:
+// Euphoria's call records for the last <days> (number, direction, talk time) and the pCloud
+// copies (which outlive Euphoria, up to 12 months). Same split as Play: an agent or setter
+// gets their own extension's calls and their own pCloud folder only; the owner gets everyone.
+const LIST_MAX = 3000;
+// pCloud reports `modified` as an RFC date; uploads set it to the call's start time.
+const archiveFileAt = (f, day) => { const t = Date.parse(f.modified || ""); return isFinite(t) && t > 0 ? new Date(t).toISOString() : new Date(`${day}T12:00:00+02:00`).toISOString(); };
+async function archiveListFiles(root, agentId) {
+  let folders;
+  if (agentId) {
+    const top = await pcloud("listfolder", { folderid: root, nofiles: 1 });
+    const mine = (top.metadata.contents || []).find((e) => e.isfolder && e.name === agentId);
+    if (!mine) return [];
+    const d = await pcloud("listfolder", { folderid: mine.folderid, recursive: 1 });
+    folders = [d.metadata];
+  } else {
+    const d = await pcloud("listfolder", { folderid: root, recursive: 1 });
+    folders = (d.metadata.contents || []).filter((e) => e.isfolder && UUID_RE.test(e.name));
+  }
+  const out = [];
+  folders.forEach((ag) => (ag.contents || []).filter((e) => e.isfolder && /^\d{4}-\d{2}$/.test(e.name)).forEach((mo) => (mo.contents || []).forEach((f) => {
+    const m = !f.isfolder && String(f.name).match(ARCHIVE_NAME_RE);
+    if (!m) return;
+    // GSM WAV → 48 kbps mono MP3, so the size gives the talk time to within a second or two.
+    const secs = m[3] === "mp3" && f.size ? Math.round((f.size * 8) / 48000) : 0;
+    out.push({ id: m[2], fileid: String(f.fileid), agentId: ag.name, at: archiveFileAt(f, m[1]), seconds: secs });
+  })));
+  return out;
+}
+router.get("/archive/list", async (req, res) => {
+  try {
+    const user = await userFromToken(req);
+    if (!user) return res.status(401).json({ error: "Sign in again." });
+    const days = Math.max(1, Math.min(90, Number(req.query.days) || 30));
+    const [map, role] = await Promise.all([extMap(), roleOf(user.id)]);
+    const owner = role === "owner", ext = map.byUser[user.id] || "";
+    const byId = new Map();
+    let euphoriaError = "", archiveWhy = "";
+    // 1. Euphoria's records: number, direction and exact talk time.
+    if (KEY() && TENANT()) {
+      const exts = owner ? [...new Set([...Object.keys(map.byExt), ext].filter(Boolean))] : (ext ? [ext] : []);
+      try {
+        for (const e of exts) {
+          (await cdrsCached(days, e)).forEach((r) => {
+            const c = shapeCall(r, map);
+            if (c.ext && c.ext !== e) return;
+            if (!c.ext) { c.ext = e; c.agentId = map.byExt[e] || null; if (c.dir === "unknown") c.dir = "out"; }
+            if (!c.at || c.dir === "internal" || !c.answered || !c.recorded || byId.has(c.id)) return;
+            byId.set(c.id, { id: c.id, at: c.at, seconds: c.seconds, dir: c.dir, other: c.other, ext: c.ext, agentId: c.agentId, fileid: null });
+          });
+        }
+      } catch (e) { euphoriaError = String(e.message || e); }
+    } else euphoriaError = "Euphoria isn't configured on the server";
+    // 2. The pCloud copies: the file id for Play, and calls Euphoria no longer lists.
+    try {
+      const a = await archiveReady();
+      (await archiveListFiles(a.root, owner ? null : user.id)).forEach((f) => {
+        const have = byId.get(f.id);
+        if (have) { have.fileid = f.fileid; if (!have.agentId) have.agentId = f.agentId; return; }
+        byId.set(f.id, { id: f.id, at: f.at, seconds: f.seconds, approx: true, dir: "", other: "", ext: "", agentId: f.agentId, fileid: f.fileid });
+      });
+    } catch (e) { archiveWhy = String(e.message || e); }
+    const calls = [...byId.values()].sort((x, y) => (x.at < y.at ? 1 : x.at > y.at ? -1 : 0)).slice(0, LIST_MAX);
+    res.set("Cache-Control", "private, no-store");
+    res.json({ calls, owner, ext, days, archive: !archiveWhy, archiveWhy: archiveWhy || undefined, euphoriaError: euphoriaError || undefined });
+  } catch (e) { sendErr(res, e, "Calls"); }
 });
 
 // Recordings older than 12 months go. Whole month folders first, then the edge month by file.

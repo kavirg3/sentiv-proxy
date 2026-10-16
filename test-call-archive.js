@@ -61,7 +61,7 @@ nodes.set("0", { id: "0", name: "/", parent: null, isfolder: true });
 const kids = (id) => [...nodes.values()].filter((n) => n.parent === id);
 const mk = (parent, name, isfolder, data, mtime) => { const id = String(nextId++); nodes.set(id, { id, name, parent, isfolder, data, mtime }); return id; };
 const meta = (n) => n.isfolder ? { isfolder: true, folderid: Number(n.id), name: n.name, parentfolderid: n.parent === null ? undefined : Number(n.parent) }
-  : { isfolder: false, fileid: Number(n.id), name: n.name, parentfolderid: Number(n.parent), size: n.data.length, modified: n.mtime };
+  : { isfolder: false, fileid: Number(n.id), name: n.name, parentfolderid: Number(n.parent), size: n.data.length, modified: n.mtime ? new Date(n.mtime * 1000).toUTCString() : undefined };   // pCloud sends an RFC date
 const byPath = (p) => { let cur = "0"; for (const part of p.split("/").filter(Boolean)) { const k = kids(cur).find((n) => n.isfolder && n.name === part); if (!k) return null; cur = k.id; } return cur; };
 const VAULT = mk("0", "Sentiv Vault", true);
 const VAULT_FILE = mk(VAULT, "2026-10-01_999.mp3", false, Buffer.from("vault"));
@@ -213,6 +213,26 @@ const filesUnder = (agent) => { const a = kids(byPath("Sentiv Call Recordings") 
   CDRS = CDRS.filter((c) => c.id !== 503);
   r = await api.get(`/archive/play/${f503}`, "agent-tok");
   check("still plays after Euphoria has dropped the call", r.status === 200 && r.body.length === n503.data.length);
+
+  // The Calls page list (v238): Euphoria records + pCloud copies, own only, owner everyone.
+  CDRS.push({ id: 509, t: "2026-10-12 13:00:00", d: 70, src: "101", dst: "0825550177", ch: "PJSIP/101-FutureLifeTech-0000010a", dch: "PJSIP/GW3-10", rec: true });   // agent, not archived yet
+  r = await api.get("/archive/list");
+  check("list: no sign-in → 401", r.status === 401);
+  r = await api.get("/archive/list", "agent-tok");
+  const aIds = (r.body.calls || []).map((c) => c.id);
+  check("list: agent sees only their own calls, newest first", r.status === 200 && JSON.stringify(aIds) === JSON.stringify(["509", "503"]) && r.body.owner === false && r.body.archive === true, JSON.stringify(r.body));
+  const a509 = (r.body.calls || []).find((c) => c.id === "509") || {}, a503 = (r.body.calls || []).find((c) => c.id === "503") || {};
+  check("list: a call not yet copied has its number and no file id", a509.other === "0825550177" && a509.seconds === 70 && a509.fileid === null && a509.agentId === AGENT, JSON.stringify(a509));
+  check("list: a call Euphoria dropped still listed from pCloud, with its time and play id", a503.fileid === String(f503) && a503.approx === true && a503.agentId === AGENT && a503.at === "2026-10-12T09:00:00.000Z" && a503.seconds >= 1, JSON.stringify(a503));
+  r = await api.get("/archive/list", "thief-tok");
+  check("list: someone with no extension and no folder gets nothing", r.status === 200 && r.body.calls.length === 0, JSON.stringify(r.body));
+  r = await api.get("/archive/list?days=500", "owner-tok");
+  const oIds = (r.body.calls || []).map((c) => c.id);
+  check("list: owner sees everyone's recorded answered calls, newest first", r.body.owner === true && JSON.stringify(oIds) === JSON.stringify(["509", "503", "501", "506"]) && r.body.days === 90, JSON.stringify(oIds) + " days=" + r.body.days);
+  const o501 = (r.body.calls || []).find((c) => c.id === "501") || {};
+  check("list: owner's row has number, talk time, file id and whose it is", o501.other === "0825550111" && o501.seconds === 252 && o501.fileid === String(f501) && o501.agentId === OWNER && o501.dir === "out", JSON.stringify(o501));
+  check("list: unanswered, unrecorded and internal calls are left out", !oIds.some((id) => ["502", "504", "505"].includes(id)));
+  CDRS = CDRS.filter((c) => c.id !== 509);
 
   // Sweep: secret, self-test, catch-up, 12-month delete
   r = await api.post("/archive/sweep");
