@@ -459,5 +459,316 @@ router.get("/transcribe/job/:job", async (req, res) => {
   } catch (e) { res.status(502).json({ error: `Transcription: ${e.message}` }); }
 });
 
-module.exports = { router, originate, _test: { saNumber, ourExtension, parseRecords, shapeCall, normNumber, sastIso } };
+// =====================================================================================
+// CALL ARCHIVE — recordings kept in our own pCloud (16 Oct 2026)
+//
+// Euphoria keeps recordings for as long as Euphoria decides. Every ANSWERED, RECORDED call
+// is copied once, as MP3, into pCloud:
+//
+//     /Sentiv Call Recordings/<agent user id>/<YYYY-MM>/<YYYY-MM-DD>_<Euphoria uID>.mp3
+//
+// The folder sits OUTSIDE PCLOUD_ROOT (the agents' Vault), so nobody can browse it there;
+// the archive refuses to run if it would land inside the Vault. The agent folder is named
+// by who OWNED the extension when the call was archived, so a later extension swap never
+// hands old calls to the new holder.
+//
+// POST /api/euphoria/archive/sync        signed in. An agent archives their own extension's
+//      calls; the owner archives everyone's. → { files: { uID: fileid }, uploaded, pending }
+// GET  /api/euphoria/archive/play/:fileid  signed in. audio/mpeg — only for the agent the
+//      call belongs to, or the owner. Works after Euphoria has deleted the call.
+// POST /api/euphoria/archive/sweep       Daily, from GitHub Actions, which proves itself with
+//      a GitHub-signed OIDC token (no shared secret to keep anywhere). It:
+//      archives the last 3 days for every extension, deletes recordings over 12 months
+//      old, and proves the upload-and-play path with a throwaway file.
+//
+// Env: PCLOUD_TOKEN, PCLOUD_REGION, PCLOUD_ROOT (shared with the Vault),
+//      CALLS_ARCHIVE_PATH (optional, default "/Sentiv Call Recordings"),
+//      CALLS_SWEEP_REPO (optional, default "kavirg3/sentiv-proxy" — whose workflow may sweep),
+//      CALLS_SWEEP_SECRET (optional x-archive-secret, for running the sweep by hand),
+//      PCLOUD_API_URL, GITHUB_OIDC_JWKS_URL (tests).
+// =====================================================================================
+const PC_API = () => (process.env.PCLOUD_API_URL || (String(process.env.PCLOUD_REGION || "eu").toLowerCase() === "us" ? "https://api.pcloud.com" : "https://eapi.pcloud.com")).replace(/\/+$/, "");
+const PC_TOKEN = () => clean(process.env.PCLOUD_TOKEN);
+const PC_ROOT = () => String(clean(process.env.PCLOUD_ROOT) || "0");
+const ARCHIVE_PATH = () => clean(process.env.CALLS_ARCHIVE_PATH) || "/Sentiv Call Recordings";
+const ARCHIVE_SECRET = () => clean(process.env.CALLS_SWEEP_SECRET);
+const SWEEP_REPO = () => clean(process.env.CALLS_SWEEP_REPO) || "kavirg3/sentiv-proxy";
+const OIDC_ISS = "https://token.actions.githubusercontent.com";
+const OIDC_AUD = "sentiv-proxy-archive";
+const OIDC_JWKS = () => process.env.GITHUB_OIDC_JWKS_URL || `${OIDC_ISS}/.well-known/jwks`;
+const ARCHIVE_KEEP_DAYS = 365;
+const ARCHIVE_PER_SYNC = 6;       // one Hub tick; the rest follow on the next tick
+const ARCHIVE_PER_SWEEP = 40;     // the daily catch-up for anyone whose Hub was closed
+const ARCHIVE_WINDOW_DAYS = 3;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ARCHIVE_NAME_RE = /^(\d{4}-\d{2}-\d{2})_(\d{1,15})\.(mp3|wav)$/;
+
+async function pcloud(method, params = {}, body) {
+  const url = new URL(`${PC_API()}/${method}`);
+  Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, String(v)));
+  const r = await fetch(url, { method: body ? "POST" : "GET", headers: { Authorization: `Bearer ${PC_TOKEN()}` }, body });
+  const d = await r.json().catch(() => ({ result: -1, error: `pCloud HTTP ${r.status}` }));
+  if (d.result !== 0) throw new Error(d.error || `pCloud error ${d.result}`);
+  return d;
+}
+async function pcloudFolder(params) {
+  const d = await pcloud("createfolderifnotexists", params);
+  return String(d.metadata.folderid);
+}
+async function pcloudUpload(folderid, name, buf, mtimeSec) {
+  const fd = new FormData();
+  fd.append("file", new Blob([buf], { type: name.endsWith(".mp3") ? "audio/mpeg" : "audio/wav" }), name);
+  const params = { folderid, nopartial: 1 };
+  if (mtimeSec) params.mtime = mtimeSec;
+  const d = await pcloud("uploadfile", params, fd);
+  const id = d.fileids && d.fileids[0];
+  if (!id) throw new Error("pCloud upload returned no file");
+  return String(id);
+}
+async function pcloudBytes(fileid) {
+  const d = await pcloud("getfilelink", { fileid });
+  const host = (d.hosts && d.hosts[0]) || "";
+  if (!host || !d.path) throw new Error("pCloud returned no host");
+  const r = await fetch(/^https?:\/\//.test(host) ? `${host}${d.path}` : `https://${host}${d.path}`);
+  if (!r.ok) throw new Error(`pCloud host returned ${r.status}`);
+  return Buffer.from(await r.arrayBuffer());
+}
+
+// The archive root, and whether it is safely outside the Vault. Cached for 10 minutes.
+let _arch = { at: 0, root: "", fenced: false, why: "" };
+async function archiveRoot() {
+  if (_arch.root && Date.now() - _arch.at < 600e3) return _arch;
+  if (!PC_TOKEN()) return (_arch = { at: Date.now(), root: "", fenced: false, why: "PCLOUD_TOKEN not set" });
+  const root = await pcloudFolder({ path: ARCHIVE_PATH() });
+  let fenced = true, why = "";
+  if (PC_ROOT() === "0") { fenced = false; why = "PCLOUD_ROOT is not set, so the Vault shows the whole drive — recordings would be visible to every agent"; }
+  else {
+    let cur = root;
+    for (let hops = 0; hops < 40; hops++) {
+      if (String(cur) === PC_ROOT()) { fenced = false; why = "the archive folder is inside the agents' Vault"; break; }
+      const d = await pcloud("listfolder", { folderid: cur, nofiles: 1 });
+      const parent = d.metadata && d.metadata.parentfolderid;
+      if (parent === undefined || parent === null || String(cur) === "0") break;
+      cur = parent;
+    }
+  }
+  _arch = { at: Date.now(), root, fenced, why };
+  return _arch;
+}
+async function archiveReady() {
+  const a = await archiveRoot();
+  if (!a.root) throw Object.assign(new Error(`Call archive isn't set up: ${a.why}`), { status: 501 });
+  if (!a.fenced) throw Object.assign(new Error(`Call archive is switched off: ${a.why}`), { status: 503 });
+  return a;
+}
+
+const _folders = new Map();   // "agent|month" → folderid
+async function monthFolder(rootId, agentId, month) {
+  const key = `${rootId}|${agentId}|${month}`;
+  if (_folders.has(key)) return _folders.get(key);
+  const agentFolder = await pcloudFolder({ folderid: rootId, name: agentId });
+  const id = await pcloudFolder({ folderid: agentFolder, name: month });
+  _folders.set(key, id);
+  if (_folders.size > 500) _folders.delete(_folders.keys().next().value);
+  return id;
+}
+const sastDay = (iso) => new Date(Date.parse(iso) + 2 * 3600e3).toISOString().slice(0, 10);
+
+// Which recorded, answered calls belong to these extensions in the last few days.
+async function archiveCandidates(exts, map, days, fresh = false) {
+  const out = [], seen = new Set();
+  for (const ext of exts) {
+    const rows = fresh ? await fetchCdrs({ days, ext }) : await cdrsCached(days, ext);
+    rows.forEach((r) => {
+      if (seen.has(String(r.uID))) return;
+      const c = shapeCall(r, map);
+      if (c.ext && c.ext !== ext) return;
+      seen.add(String(r.uID));
+      if (!c.ext) { c.ext = ext; c.agentId = map.byExt[ext] || null; }
+      if (c.dir === "internal" || !c.at || !c.answered || !c.recorded || !c.agentId || !UUID_RE.test(c.agentId)) return;
+      out.push(c);
+    });
+  }
+  return out.sort((a, b) => (a.at < b.at ? -1 : 1));   // oldest first, so none age out of the window
+}
+
+const _archBusy = new Set();
+async function archiveCalls(calls, cap) {
+  const a = await archiveReady();
+  const files = {}, groups = new Map();
+  calls.forEach((c) => {
+    const k = `${c.agentId}|${sastDay(c.at).slice(0, 7)}`;
+    (groups.get(k) || groups.set(k, []).get(k)).push(c);
+  });
+  const todo = [];
+  for (const [k, list] of groups) {
+    const [agentId, month] = k.split("|");
+    const folder = await monthFolder(a.root, agentId, month);
+    const d = await pcloud("listfolder", { folderid: folder });
+    const have = {};
+    ((d.metadata && d.metadata.contents) || []).forEach((e) => { const m = !e.isfolder && String(e.name).match(ARCHIVE_NAME_RE); if (m) have[m[2]] = String(e.fileid); });
+    list.forEach((c) => { if (have[c.id]) files[c.id] = have[c.id]; else todo.push({ c, folder }); });
+  }
+  let uploaded = 0, errors = 0;
+  for (const { c, folder } of todo) {
+    if (uploaded >= cap) break;
+    if (_archBusy.has(c.id)) continue;   // another device is uploading this one right now
+    _archBusy.add(c.id);
+    try {
+      const wav = await audioFor(c.id);
+      const mp3 = await toMp3(wav);
+      const name = `${sastDay(c.at)}_${c.id}.${mp3 ? "mp3" : "wav"}`;
+      files[c.id] = await pcloudUpload(folder, name, mp3 || wav, Math.floor(Date.parse(c.at) / 1000));
+      uploaded++;
+    } catch (e) {
+      errors++;
+      console.log(`[archive] cdr=${c.id} failed: ${String(e.message).replace(/\d{6,}/g, "***")}`);
+    } finally { _archBusy.delete(c.id); }
+  }
+  const pending = todo.filter((t) => !files[t.c.id]).length;
+  if (uploaded || errors) console.log(`[archive] uploaded=${uploaded} errors=${errors} pending=${pending}`);
+  return { files, uploaded, pending, errors };
+}
+
+// Who may play an archived file: walk file → month folder → agent folder → archive root.
+// Anything not exactly in that shape (a Vault file, a personal file) is refused.
+async function archiveOwnerOf(fileid) {
+  if (!/^\d{1,20}$/.test(String(fileid))) return null;
+  const a = await archiveReady();
+  const f = await pcloud("checksumfile", { fileid }).catch(() => null);
+  const meta = f && f.metadata;
+  if (!meta || meta.isfolder || !ARCHIVE_NAME_RE.test(String(meta.name))) return null;
+  const month = await pcloud("listfolder", { folderid: meta.parentfolderid, nofiles: 1 }).catch(() => null);
+  const mm = month && month.metadata;
+  if (!mm || !/^\d{4}-\d{2}$/.test(String(mm.name))) return null;
+  const agent = await pcloud("listfolder", { folderid: mm.parentfolderid, nofiles: 1 }).catch(() => null);
+  const am = agent && agent.metadata;
+  if (!am || !UUID_RE.test(String(am.name)) || String(am.parentfolderid) !== String(a.root)) return null;
+  return { agentId: String(am.name), name: String(meta.name) };
+}
+
+const sendErr = (res, e, label) => res.status(e.status || 502).json({ error: `${label}: ${e.message}` });
+
+router.post("/archive/sync", async (req, res) => {
+  try {
+    const g = await gate(req, res); if (!g) return;
+    const exts = g.owner ? [...new Set([...Object.keys(g.map.byExt), g.ext].filter(Boolean))] : (g.ext ? [g.ext] : []);
+    if (!exts.length) return res.json({ files: {}, uploaded: 0, pending: 0, needsExtension: true });
+    const lock = `sync:${g.user.id}`;
+    if (_archBusy.has(lock)) return res.json({ files: {}, uploaded: 0, pending: 0, busy: true });
+    _archBusy.add(lock);
+    try {
+      const calls = await archiveCandidates(exts, g.map, ARCHIVE_WINDOW_DAYS);
+      res.json(await archiveCalls(calls, ARCHIVE_PER_SYNC));
+    } finally { _archBusy.delete(lock); }
+  } catch (e) { sendErr(res, e, "Call archive"); }
+});
+
+router.get("/archive/play/:fileid", async (req, res) => {
+  try {
+    const user = await userFromToken(req);
+    if (!user) return res.status(401).json({ error: "Sign in again." });
+    const owner = (await roleOf(user.id)) === "owner";
+    const who = await archiveOwnerOf(req.params.fileid);
+    if (!who || (!owner && who.agentId !== user.id)) return res.status(404).json({ error: "No such recording for you." });
+    const buf = await pcloudBytes(req.params.fileid);
+    res.set("Cache-Control", "private, no-store");
+    res.type(who.name.endsWith(".mp3") ? "audio/mpeg" : "audio/wav");
+    res.send(buf);
+  } catch (e) { sendErr(res, e, "Recording"); }
+});
+
+// Recordings older than 12 months go. Whole month folders first, then the edge month by file.
+async function pruneArchive(rootId, now = Date.now()) {
+  const cutoff = new Date(now - ARCHIVE_KEEP_DAYS * 864e5).toISOString().slice(0, 10);
+  const cutMonth = cutoff.slice(0, 7);
+  let files = 0, folders = 0;
+  const top = await pcloud("listfolder", { folderid: rootId, nofiles: 1 });
+  for (const ag of (top.metadata.contents || []).filter((e) => e.isfolder && UUID_RE.test(e.name))) {
+    const months = await pcloud("listfolder", { folderid: ag.folderid, nofiles: 1 });
+    for (const m of (months.metadata.contents || []).filter((e) => e.isfolder && /^\d{4}-\d{2}$/.test(e.name))) {
+      if (m.name < cutMonth) { await pcloud("deletefolderrecursive", { folderid: m.folderid }); folders++; continue; }
+      if (m.name > cutMonth) continue;
+      const list = await pcloud("listfolder", { folderid: m.folderid });
+      for (const f of (list.metadata.contents || [])) {
+        const mm = !f.isfolder && String(f.name).match(ARCHIVE_NAME_RE);
+        if (mm && mm[1] < cutoff) { await pcloud("deletefile", { fileid: f.fileid }); files++; }
+      }
+    }
+  }
+  return { cutoff, files, folders };
+}
+
+// Proves the real path end to end: upload a tiny file where recordings go, read it back
+// through the same code the Play button uses, then delete it.
+async function archiveSelfTest(rootId) {
+  const folder = await pcloudFolder({ folderid: rootId, name: "_selftest" });
+  const probe = Buffer.from(`sentiv archive self-test ${Date.now()} ${Math.random()}`);
+  const id = await pcloudUpload(folder, `selftest-${Date.now()}.txt`, probe);
+  try {
+    const back = await pcloudBytes(id);
+    return back.equals(probe);
+  } finally { await pcloud("deletefile", { fileid: id }).catch(() => {}); }
+}
+
+// Is this request the scheduled (or hand-run) workflow on main of OUR repo? GitHub signs
+// a short-lived token per run; we check the signature against GitHub's published keys and
+// the claims, so a token from any other repo, branch, event or audience is refused.
+const _jwks = { at: 0, keys: [] };
+async function githubKey(kid) {
+  if (!_jwks.keys.length || Date.now() - _jwks.at > 3600e3 || !_jwks.keys.some((k) => k.kid === kid)) {
+    const r = await fetch(OIDC_JWKS());
+    const d = await r.json().catch(() => ({}));
+    if (Array.isArray(d.keys)) { _jwks.keys = d.keys; _jwks.at = Date.now(); }
+  }
+  return _jwks.keys.find((k) => k.kid === kid) || null;
+}
+async function fromOurWorkflow(req) {
+  try {
+    const tok = (req.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
+    const parts = tok.split(".");
+    if (parts.length !== 3) return false;
+    const dec = (x) => JSON.parse(Buffer.from(x, "base64url").toString("utf8"));
+    const head = dec(parts[0]), claims = dec(parts[1]);
+    if (head.alg !== "RS256") return false;
+    const jwk = await githubKey(head.kid);
+    if (!jwk) return false;
+    const crypto = require("crypto");
+    const ok = crypto.verify("RSA-SHA256", Buffer.from(`${parts[0]}.${parts[1]}`), crypto.createPublicKey({ key: jwk, format: "jwk" }), Buffer.from(parts[2], "base64url"));
+    const now = Date.now() / 1000;
+    const aud = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+    return ok && claims.iss === OIDC_ISS && aud.includes(OIDC_AUD) && claims.repository === SWEEP_REPO()
+      && claims.ref === "refs/heads/main" && ["schedule", "workflow_dispatch"].includes(claims.event_name)
+      && Number(claims.exp) > now && Number(claims.nbf || claims.iat || 0) <= now + 60;
+  } catch (e) { return false; }
+}
+
+router.post("/archive/sweep", async (req, res) => {
+  const bySecret = !!ARCHIVE_SECRET() && clean(req.get("x-archive-secret")) === ARCHIVE_SECRET();
+  if (!bySecret && !(await fromOurWorkflow(req))) return res.status(401).json({ error: "only the daily GitHub workflow may run the archive sweep" });
+  const out = { ok: false };
+  try {
+    const a = await archiveReady();
+    out.selftest = await archiveSelfTest(a.root);
+    if (KEY() && TENANT() && SB_URL() && SB_SERVICE()) {
+      const map = await extMap();
+      const calls = await archiveCandidates(Object.keys(map.byExt), map, ARCHIVE_WINDOW_DAYS, true);
+      const r = await archiveCalls(calls, ARCHIVE_PER_SWEEP);
+      Object.assign(out, { recorded: calls.length, archived: Object.keys(r.files).length, uploaded: r.uploaded, pending: r.pending, errors: r.errors });
+    } else out.skipped = "Euphoria or Supabase not configured";
+    out.prune = await pruneArchive(a.root);
+    out.ok = out.selftest === true;   // a call Euphoria won't hand over is reported, not fatal
+    console.log(`[archive] sweep ${JSON.stringify(out)}`);
+    res.status(out.ok ? 200 : 500).json(out);
+  } catch (e) { out.error = e.message; res.status(e.status || 502).json(out); }
+});
+
+router.get("/archive/health", async (_req, res) => {
+  try {
+    const a = await archiveRoot();
+    res.json({ ok: !!a.root && a.fenced, configured: !!PC_TOKEN(), fenced: a.fenced, why: a.why || undefined, sweep: "github-oidc", sweepRepo: SWEEP_REPO(), keepDays: ARCHIVE_KEEP_DAYS });
+  } catch (e) { res.json({ ok: false, configured: !!PC_TOKEN(), error: e.message }); }
+});
+
+module.exports = { router, originate, _test: { saNumber, ourExtension, parseRecords, shapeCall, normNumber, sastIso, pruneArchive } };
 

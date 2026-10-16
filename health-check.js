@@ -45,7 +45,8 @@ async function proxy() {
   // Must refuse anyone without a sign-in. Each of these answered strangers before 13 Oct.
   const closed = [["POST", "/api/pcloud/list"], ["POST", "/api/pcloud/fetch"], ["POST", "/api/anthropic"], ["GET", "/api/kuration/projects"],
     ["POST", "/api/kuration/rows"], ["POST", "/api/team/invite"], ["GET", "/api/euphoria/calls"], ["POST", "/api/euphoria-originate"],
-    ["POST", "/api/vbout-contact"], ["POST", "/api/manyreach-enroll"], ["POST", "/api/repliq-generate"], ["POST", "/api/push/test"]];
+    ["POST", "/api/vbout-contact"], ["POST", "/api/manyreach-enroll"], ["POST", "/api/repliq-generate"], ["POST", "/api/push/test"],
+    ["POST", "/api/euphoria/archive/sync"], ["GET", "/api/euphoria/archive/play/1"]];
   for (const [m, p] of closed) {
     const r = await get(`${PROXY}${p}`, { method: m, headers: { "Content-Type": "application/json" }, body: m === "GET" ? undefined : "{}" });
     check("Server lock", `${m} ${p} refuses strangers`, r.status === 401, `HTTP ${r.status}`);
@@ -58,6 +59,16 @@ async function proxy() {
   check("Phones", "Euphoria accepts our key", e.auth === "accepted", e.auth || `HTTP ${eu.status}`);
   check("Phones", "call recordings convert to playable audio", e.mp3 === true, String(e.mp3));
   if (!e.stt) warn("Phones", "call summaries are OFF", "ASSEMBLYAI_API_KEY not set on Railway");
+  // Call recordings are copied into pCloud, in a folder agents can't browse from the Vault.
+  const ar = await get(`${PROXY}/api/euphoria/archive/health`);
+  const arj = ar.json || {};
+  check("Phones", "call recordings are archived to pCloud, outside the Vault", arj.ok === true && arj.fenced === true, arj.why || arj.error || `HTTP ${ar.status}`);
+  check("Phones", "the daily archive sweep only answers this repo's GitHub workflow", arj.sweep === "github-oidc" && arj.sweepRepo === "kavirg3/sentiv-proxy", `${arj.sweep} ${arj.sweepRepo}`);
+  const asw = await get(`${PROXY}/api/euphoria/archive/sweep`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  check("Phones", "the archive sweep refuses strangers", asw.status === 401, `HTTP ${asw.status}`);
+  const fake = ["eyJhbGciOiJSUzI1NiIsImtpZCI6ImZha2UifQ", Buffer.from(JSON.stringify({ iss: "https://token.actions.githubusercontent.com", aud: "sentiv-proxy-archive", repository: "kavirg3/sentiv-proxy", ref: "refs/heads/main", event_name: "schedule", exp: 9999999999 })).toString("base64url"), "c2ln"].join(".");
+  const asf = await get(`${PROXY}/api/euphoria/archive/sweep`, { method: "POST", headers: { Authorization: `Bearer ${fake}` } });
+  check("Phones", "the archive sweep refuses a forged GitHub token", asf.status === 401, `HTTP ${asf.status}`);
 
   const pu = await get(`${PROXY}/api/push/health`);
   const p = pu.json || {};

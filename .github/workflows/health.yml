@@ -1,6 +1,8 @@
 # Sentiv Hub daily health check — 06:00 SAST (04:00 UTC) every day.
 # Runs health-check.js against the LIVE Hub, proxy and database using only public access.
-# If anything is broken the run fails and GitHub emails the repo owner. Nothing to set up.
+# If anything is broken the run fails and GitHub emails the repo owner.
+# Then archives call recordings to pCloud. No secret: the run proves itself to the proxy with
+# a GitHub-signed OIDC token (id-token: write below).
 # Run it by hand any time: GitHub → Actions → "Sentiv Hub daily health" → Run workflow.
 name: Sentiv Hub daily health
 on:
@@ -9,10 +11,11 @@ on:
   workflow_dispatch: {}
 permissions:
   contents: read
+  id-token: write   # lets archive-sweep.js prove to the proxy that it is this workflow
 jobs:
   health:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -20,3 +23,8 @@ jobs:
           node-version: "20"
       - name: Check the live Hub, proxy and database
         run: node health-check.js
+      # Copies missed call recordings into pCloud and deletes ones over 12 months old.
+      # Runs even when a health check above failed.
+      - name: Archive call recordings, delete those over 12 months
+        if: always()
+        run: node archive-sweep.js

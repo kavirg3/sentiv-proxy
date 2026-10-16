@@ -57,6 +57,8 @@ const PUBLIC_ROUTES = [
   ["GET", /^\/api\/whatsapp\/webhook$/],     // Meta's verify-token handshake
   ["POST", /^\/api\/whatsapp\/webhook$/],    // HMAC over the raw body
   ["GET", /^\/api\/euphoria\/health$/],
+  ["GET", /^\/api\/euphoria\/archive\/health$/],
+  ["POST", /^\/api\/euphoria\/archive\/sweep$/],  // x-archive-secret (daily GitHub Action)
 ];
 const _tokCache = new Map();   // token -> { uid, until }
 async function signedInUser(req) {
