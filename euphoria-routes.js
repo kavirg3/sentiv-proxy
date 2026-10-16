@@ -381,14 +381,15 @@ async function ownedCall(g, id) {
 // Euphoria's docs give no input fields for the recording downloads, and the first guess
 // (<cdrID>) answers "Api Service Error" on live calls (16 Oct 2026) — while GetCdrDetails
 // takes <CdrID>. So try the likely shapes in order, remember the one that works, and log
-// which it was (never the number or file name).
+// which it was (never the number or file name). Live, 16 Oct 2026: <uniqueId> works, so it
+// goes first; the rest stay as fallbacks in case Euphoria changes it.
 const REC_WAYS = [
+  ["DownloadCallRecordingByUniqueId", (id, ref) => ref.unique && ({ uniqueId: ref.unique })],
   ["DownloadCallRecordingByCdrID", (id) => ({ CdrID: id })],
   ["DownloadCallRecordingByCdrID", (id) => ({ cdrID: id })],
   ["DownloadCallRecordingByCdrID", (id) => ({ cdrId: id })],
   ["DownloadCallRecordingByFilename", (id, ref) => ref.file && ({ filename: ref.file })],
   ["DownloadCallRecordingByFilename", (id, ref) => ref.file && ({ fileName: ref.file })],
-  ["DownloadCallRecordingByUniqueId", (id, ref) => ref.unique && ({ uniqueId: ref.unique })],
   ["DownloadCallRecordingByUniqueId", (id, ref) => ref.unique && ({ UniqueID: ref.unique })],
 ];
 let _recWay = -1;
@@ -785,6 +786,25 @@ async function fromOurWorkflow(req) {
   } catch (e) { return false; }
 }
 
+// What the archive holds (counts and sizes only), so the daily run shows it is real audio.
+async function archiveStats(rootId) {
+  const st = { agents: 0, files: 0, mp3: 0, wav: 0, mb: 0, thisMonth: 0 };
+  const month = sastDay(new Date().toISOString()).slice(0, 7);
+  const d = await pcloud("listfolder", { folderid: rootId, recursive: 1 });
+  for (const ag of (d.metadata.contents || []).filter((e) => e.isfolder && UUID_RE.test(e.name))) {
+    st.agents++;
+    for (const mo of (ag.contents || []).filter((e) => e.isfolder)) {
+      for (const f of (mo.contents || []).filter((e) => !e.isfolder && ARCHIVE_NAME_RE.test(e.name))) {
+        st.files++; st.mb += (f.size || 0) / 1048576;
+        if (/\.mp3$/.test(f.name)) st.mp3++; else st.wav++;
+        if (mo.name === month) st.thisMonth++;
+      }
+    }
+  }
+  st.mb = Math.round(st.mb * 10) / 10;
+  return st;
+}
+
 router.post("/archive/sweep", async (req, res) => {
   const bySecret = !!ARCHIVE_SECRET() && clean(req.get("x-archive-secret")) === ARCHIVE_SECRET();
   if (!bySecret && !(await fromOurWorkflow(req))) return res.status(401).json({ error: "only the daily GitHub workflow may run the archive sweep" });
@@ -799,6 +819,7 @@ router.post("/archive/sweep", async (req, res) => {
       Object.assign(out, { recorded: calls.length, archived: Object.keys(r.files).length, uploaded: r.uploaded, pending: r.pending, errors: r.errors });
     } else out.skipped = "Euphoria or Supabase not configured";
     out.prune = await pruneArchive(a.root);
+    out.stats = await archiveStats(a.root).catch((e) => ({ error: e.message }));
     out.ok = out.selftest === true;   // a call Euphoria won't hand over is reported, not fatal
     console.log(`[archive] sweep ${JSON.stringify(out)}`);
     res.status(out.ok ? 200 : 500).json(out);

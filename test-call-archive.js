@@ -89,7 +89,8 @@ const pc = http.createServer((req, res) => {
     }
     if (m === "listfolder") {
       const n = nodes.get(q.folderid); if (!n || !n.isfolder) return err("Directory does not exist.");
-      return ok({ metadata: { ...meta(n), contents: kids(n.id).filter((k) => !q.nofiles || k.isfolder).map(meta) } });
+      const tree = (x) => ({ ...meta(x), ...(x.isfolder ? { contents: kids(x.id).filter((k) => !q.nofiles || k.isfolder).map((k) => (q.recursive && k.isfolder ? tree(k) : meta(k))) } : {}) });
+      return ok({ metadata: tree(n) });
     }
     if (m === "uploadfile") {
       const body = Buffer.concat(chunks);
@@ -246,6 +247,7 @@ const filesUnder = (agent) => { const a = kids(byPath("Sentiv Call Recordings") 
   r = await api.post("/archive/sweep", jwt({ event_name: "workflow_dispatch" }));
   check("sweep: our workflow's token accepted, self-test passed", r.status === 200 && r.body.ok === true && r.body.selftest === true, JSON.stringify(r.body));
   check("sweep catches up a call nobody's Hub archived (508)", r.body.uploaded === 1 && filesUnder(AGENT).includes("2026-10/2026-10-13_508.mp3"), JSON.stringify(r.body));
+  check("sweep reports what the archive holds (all MP3)", r.body.stats && r.body.stats.agents === 2 && r.body.stats.mp3 === 5 && r.body.stats.wav === 0 && r.body.stats.thisMonth === 4, JSON.stringify(r.body.stats));
   check("sweep deletes month folders older than 12 months", !nodes.get(oldDir), JSON.stringify(r.body.prune));
   check("sweep deletes the edge month's files past 365 days, keeps newer", !nodes.get(oldF) && !!nodes.get(keepF), JSON.stringify(r.body.prune));
   check("sweep leaves files that aren't recordings alone", !!nodes.get(strayF));

@@ -24,6 +24,8 @@ const AUDIENCE = "sentiv-proxy-archive";
     `${d.errors ? "WARN" : "ok  "}  archived ${d.archived ?? "?"} of ${d.recorded ?? "?"} recorded calls from the last 3 days (${d.uploaded ?? 0} new, ${d.pending ?? 0} left for tomorrow, ${d.errors ?? 0} Euphoria wouldn't hand over)`,
     `ok    deleted ${d.prune ? d.prune.files : "?"} recording(s) and ${d.prune ? d.prune.folders : "?"} month folder(s) older than ${d.prune ? d.prune.cutoff : "12 months"}`,
   ];
+  const st = d.stats || {};
+  if (st.files !== undefined) lines.push(`ok    pCloud holds ${st.files} recording(s) for ${st.agents} people, ${st.mb} MB (${st.thisMonth} this month${st.wav ? `, ${st.wav} not converted to MP3` : ""})`);
   if (d.skipped) lines.push(`WARN  ${d.skipped}`);
   if (d.error) lines.push(`FAIL  ${d.error}`);
   console.log(`Call recording archive — HTTP ${status}\n${lines.map((l) => "  " + l).join("\n")}`);
