@@ -19,12 +19,12 @@ const sb = http.createServer((req, res) => {
   const hit = async (m, path, tok, body) => (await fetch(B + path, { method: m, headers: { "Content-Type": "application/json", ...(tok ? { Authorization: `Bearer ${tok}` } : {}) }, body: m === "GET" ? undefined : JSON.stringify(body || {}) })).status;
   const closed = [["POST", "/api/anthropic"], ["POST", "/api/pcloud/list"], ["POST", "/api/pcloud/fetch"], ["POST", "/api/pcloud/search"], ["POST", "/api/pcloud/link"], ["POST", "/api/pcloud/share"],
     ["GET", "/api/kuration/projects"], ["POST", "/api/kuration/rows"], ["GET", "/api/kuration/builders"], ["POST", "/api/kuration/sweeps"], ["POST", "/api/vbout-contact"], ["POST", "/api/manyreach-enroll"],
-    ["POST", "/api/repliq-generate"], ["POST", "/api/repliq-stats"], ["POST", "/api/euphoria-originate"], ["GET", "/api/euphoria/calls"], ["POST", "/api/push/test"], ["POST", "/api/team/invite"], ["GET", "/api/anything-new"]];
+    ["POST", "/api/repliq-generate"], ["POST", "/api/repliq-stats"], ["POST", "/api/euphoria-originate"], ["GET", "/api/euphoria/calls"], ["POST", "/api/push/test"], ["POST", "/api/push/won"], ["POST", "/api/push/image"], ["POST", "/api/push/preview"], ["GET", "/api/push/img/../../x"], ["POST", "/api/team/invite"], ["GET", "/api/anything-new"]];
   for (const [m, pth] of closed) check(`${m} ${pth}: no sign-in → 401`, (await hit(m, pth)) === 401);
   for (const [m, pth] of closed.slice(0, 3)) check(`${m} ${pth}: forged token → 401`, (await hit(m, pth, "forged")) === 401);
   check("signed in: AI route passes the gate (then says key missing)", (await hit("POST", "/api/anthropic", "good", { messages: [{ role: "user", content: "x" }] })) === 500);
   check("signed in: Vault passes the gate", (await hit("POST", "/api/pcloud/list", "good")) !== 401);
-  const open = [["GET", "/health"], ["GET", "/api/push/key"], ["GET", "/api/push/health"], ["GET", "/api/kuration/health"], ["GET", "/api/whatsapp/health"], ["GET", "/api/euphoria/health"]];
+  const open = [["GET", "/health"], ["GET", "/api/push/key"], ["GET", "/api/push/health"], ["GET", "/api/kuration/health"], ["GET", "/api/whatsapp/health"], ["GET", "/api/euphoria/health"], ["GET", "/api/push/img/won-0123456789ab.jpg"]];
   for (const [m, pth] of open) check(`${m} ${pth} stays public`, (await hit(m, pth)) !== 401);
   check("POST /api/push/sweep still guarded by its own secret (not by sign-in)", (await hit("POST", "/api/push/sweep")) !== 200 && (await hit("POST", "/api/push/sweep")) !== 401 || true);
   const body = async (m, pth) => { const r = await fetch(B + pth, { method: m, headers: { "Content-Type": "application/json" }, body: "{}" }); return `${r.status} ${(await r.text()).slice(0, 80)}`; };

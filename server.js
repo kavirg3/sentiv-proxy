@@ -50,6 +50,7 @@ const PUBLIC_ROUTES = [
   ["GET", /^\/api\/push\/key$/],            // VAPID PUBLIC key — public by definition
   ["GET", /^\/api\/push\/health$/],
   ["POST", /^\/api\/push\/sweep$/],          // x-sweep-secret
+  ["GET", /^\/api\/push\/img\/[a-z]+-[0-9a-f]{12}\.(jpg|png|webp)$/],   // notification pictures — phones fetch them with no sign-in
   ["GET", /^\/api\/kuration\/health$/],
   ["POST", /^\/api\/kuration\/webhook$/],    // HMAC over the raw body
   ["GET", /^\/api\/whatsapp\/health$/],
