@@ -45,7 +45,7 @@ async function proxy() {
   // Must refuse anyone without a sign-in. Each of these answered strangers before 13 Oct.
   const closed = [["POST", "/api/pcloud/list"], ["POST", "/api/pcloud/fetch"], ["POST", "/api/anthropic"], ["GET", "/api/kuration/projects"],
     ["POST", "/api/kuration/rows"], ["POST", "/api/team/invite"], ["GET", "/api/euphoria/calls"], ["POST", "/api/euphoria-originate"],
-    ["POST", "/api/vbout-contact"], ["POST", "/api/manyreach-enroll"], ["POST", "/api/repliq-generate"], ["POST", "/api/push/test"],
+    ["POST", "/api/vbout-contact"], ["POST", "/api/manyreach-enroll"], ["POST", "/api/repliq-generate"], ["POST", "/api/push/test"], ["POST", "/api/push/remind/test"],
     ["POST", "/api/euphoria/archive/sync"], ["GET", "/api/euphoria/archive/play/1"], ["GET", "/api/euphoria/archive/list"]];
   for (const [m, p] of closed) {
     const r = await get(`${PROXY}${p}`, { method: m, headers: { "Content-Type": "application/json" }, body: m === "GET" ? undefined : "{}" });
@@ -75,6 +75,11 @@ async function proxy() {
   check("Notifications", "push alerts can be sent", p.ok && p.vapid && p.supabase && p.sweep, JSON.stringify({ vapid: p.vapid, supabase: p.supabase, sweep: p.sweep }));
   check("Notifications", "deal-won alerts and editable wording are live", p.dealWon === true, String(p.dealWon));
   check("Notifications", "chase-the-quote alerts are on", Array.isArray(p.templates) && p.templates.includes("quote"), JSON.stringify(p.templates));
+  check("Notifications", "personal reminders are running (every minute)", !!p.reminders && !p.reminders.error && !!p.reminders.lastRun && Date.now() - Date.parse(p.reminders.lastRun) < 10 * 60e3, JSON.stringify(p.reminders));
+  check("Notifications", "the platform watchdog is running", !!p.watchdog && !!p.watchdog.checkedAt && Date.now() - Date.parse(p.watchdog.checkedAt) < 20 * 60e3, JSON.stringify(p.watchdog));
+  if (p.watchdog && Array.isArray(p.watchdog.failing) && p.watchdog.failing.length) warn("Notifications", "the watchdog sees a problem right now", p.watchdog.failing.join(" · "));
+  const pal = await get(`${PROXY}/api/push/alert`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ results: [{ area: "x", name: "forged", ok: false }] }) });
+  check("Notifications", "only our GitHub workflow can raise a platform alert", pal.status === 401, `HTTP ${pal.status}`);
   // Phones fetch notification pictures with no sign-in: the route must answer (404 for an
   // unknown picture), not 401 — and never serve a file outside its own folder.
   const pimg = await get(`${PROXY}/api/push/img/won-000000000000.jpg`);
@@ -129,5 +134,21 @@ async function database() {
       `${results.length} checks run.`].join("\n");
     require("fs").appendFileSync(process.env.GITHUB_STEP_SUMMARY, md + "\n");
   }
+  await reportToProxy();
   process.exit(failed.length ? 1 : 0);
 })();
+
+// v239 — hand every result to the proxy, which buzzes the owner's phone at once if anything
+// failed (and "Fixed" when it passes again). Proves it is this workflow with a GitHub-signed
+// token, so nobody else can raise or clear an alert. Run locally there is no token: skipped.
+// If the proxy itself is down this can't reach it — GitHub's failure email still goes out.
+async function reportToProxy() {
+  const reqUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL, reqTok = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+  if (!reqUrl || !reqTok) { console.log("\n(alert phone: skipped — not running in GitHub Actions)"); return; }
+  try {
+    const idt = await fetch(`${reqUrl}&audience=sentiv-proxy-archive`, { headers: { Authorization: `Bearer ${reqTok}` } }).then((r) => r.json());
+    const r = await get(`${PROXY}/api/push/alert`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${idt.value}` },
+      body: JSON.stringify({ results: results.filter((x) => !x.warn).map(({ area, name, ok, detail }) => ({ area, name, ok, detail })) }) });
+    console.log(`\nalert phone: HTTP ${r.status} ${r.text.slice(0, 200)}`);
+  } catch (e) { console.log(`\nalert phone: could not reach the proxy — ${e.message || e}`); }
+}

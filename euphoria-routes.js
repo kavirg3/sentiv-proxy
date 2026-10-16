@@ -904,5 +904,5 @@ router.get("/archive/health", async (_req, res) => {
   } catch (e) { res.json({ ok: false, configured: !!PC_TOKEN(), error: e.message }); }
 });
 
-module.exports = { router, originate, _test: { saNumber, ourExtension, parseRecords, shapeCall, normNumber, sastIso, pruneArchive } };
+module.exports = { router, originate, fromOurWorkflow, _test: { saNumber, ourExtension, parseRecords, shapeCall, normNumber, sastIso, pruneArchive } };
 

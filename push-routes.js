@@ -41,6 +41,9 @@
 //   POST /api/push/image    owner uploads a notification picture
 //   GET  /api/push/img/:f   serves that picture to phones (public — content-hashed names)
 //   POST /api/push/preview  owner sends themselves one message of a kind, with sample words
+//   POST /api/push/remind/test  anyone: one of their own reminders, now, to their own devices
+//   POST /api/push/alert    the GitHub health-check workflow reports results (OIDC-signed)
+//   (in-process) personal reminders every minute; platform watchdog every 5 minutes
 // ============================================================================
 
 const express = require("express");
@@ -110,7 +113,7 @@ async function userFromToken(req) {
 // A subscription is a perishable thing: the browser rotates it, the agent clears site
 // data, the phone is wiped. 404 and 410 mean "this endpoint is dead forever" — delete
 // it, or the table fills with addresses that can never be reached again.
-async function sendTo(subs, payload) {
+async function sendTo(subs, payload, opts = {}) {
   const body = JSON.stringify(payload);
   let sent = 0;
   const dead = [];
@@ -119,7 +122,7 @@ async function sendTo(subs, payload) {
       await webpush.sendNotification(
         { endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } },
         body,
-        { TTL: 60 * 60 * 12, urgency: "normal" }
+        { TTL: opts.ttl || 60 * 60 * 12, urgency: opts.urgency || "normal" }
       );
       sent++;
     } catch (e) {
@@ -161,6 +164,9 @@ router.get("/health", (_req, res) => {
     weeklyDigest: `Mondays from ${DIGEST_HOUR}:00 SAST — team numbers to the owner, own deals to everyone`,
     dealWon: true,          // v234 — /won, /image, /img, /preview
     templates: PUSH_KINDS,
+    // v239 — personal reminders and the platform watchdog. Names of failing checks only.
+    reminders: { every: "1 min", lastRun: _remindLast.at ? new Date(_remindLast.at).toISOString() : null, error: _remindLast.error || undefined },
+    watchdog: { every: `${Math.round(WATCH_MS / 60000)} min`, ...watchStatus() },
   });
 });
 
@@ -232,6 +238,9 @@ const PUSH_DEFAULTS = {
   week: { title: "Your week — Sentiv", body: "{todo} {lastweek}" },
   digest: { title: "Sentiv — last week's next steps", body: "{summary}" },
   test: { title: "Sentiv Sales Hub — test", body: "Your notifications are working. You'll get follow-up alerts here, and a short note about your deals every Monday." },
+  // v239 — a reminder someone set for themselves, and the owner's "something is broken" alert.
+  remind: { title: "Reminder", body: "{text}" },
+  alert: { title: "Sentiv needs you: {problem}", body: "{detail}" },
 };
 const PUSH_KINDS = Object.keys(PUSH_DEFAULTS);
 // Where a notification's picture is served from. Phones fetch it themselves, with no
@@ -558,7 +567,8 @@ router.get("/img/:file", async (req, res) => {
 // team would get it — the "Send me a test" button under each template in the Hub.
 const SAMPLE = { company: "Mthembu Logistics", value: "R84 500", agent: "Thabo", month: "R312 000", stage: "Quotation Sent", contact: "Sipho Dlamini", firstname: "Sipho", days: 9,
   todo: "This week: 2 overdue · 4 follow-ups due · 3 going cold.", lastweek: "Last week you saved 6 next steps and finished 4.",
-  summary: "AI wrote 18 lines · agents saved 12 (9 from AI) · 7 marked done. Saved up 3 on the week before." };
+  summary: "AI wrote 18 lines · agents saved 12 (9 from AI) · 7 marked done. Saved up 3 on the week before.",
+  text: "Call Sipho about the Mthembu quote", problem: "The database isn't answering", detail: "supabase 503 · since 09:42 · test only, nothing is broken" };
 const _lastPreview = {};
 router.post("/preview", async (req, res) => {
   if (!need(res)) return;
@@ -880,6 +890,240 @@ router.post("/sweep", async (req, res) => {
   }
 });
 
+// ---- Personal reminders (Hub v239) ----------------------------------------------------
+// Anyone can set reminders for themselves in Settings → Notifications. The Hub keeps them
+// in that person's own user_state row "reminders" (it syncs like their text size does);
+// this loop reads those rows once a minute and buzzes the person's own devices at the time
+// they picked. Quiet hours do NOT apply: the person chose the time.
+//
+// A reminder: { id, text, time "HH:MM" (SAST), date "YYYY-MM-DD", repeat, off, created }
+//   repeat "once"     → on `date`
+//          "daily"    → every day from `date`
+//          "weekdays" → Monday to Friday from `date`
+//          "weekly"   → the weekday of `date`, every week from it
+// One push per reminder per day (push_log guard row, written first). A reminder whose time
+// passed while this server was restarting still goes out up to REMIND_LATE_MIN later; older
+// than that it is skipped rather than buzzing about a 09:00 call at 17:00.
+const REMIND_MS = num(process.env.PUSH_REMIND_MS, 60000);
+const REMIND_LATE_MIN = 6 * 60;
+const SAST_MS = 2 * 3600e3;   // South Africa has no daylight saving
+const REMIND_ID = /^[a-z0-9]{4,24}$/i;
+function sastParts(ms) {
+  const d = new Date(ms + SAST_MS);
+  return { day: d.toISOString().slice(0, 10), min: d.getUTCHours() * 60 + d.getUTCMinutes(), dow: d.getUTCDay() };
+}
+const dowOf = (ymd) => new Date(`${ymd}T00:00:00Z`).getUTCDay();
+// Pure: the reminders in `list` that should buzz at `now`.
+function remindersDue(list, now) {
+  const t = sastParts(now);
+  const out = [];
+  (Array.isArray(list) ? list : []).forEach((r) => {
+    if (!r || typeof r !== "object" || r.off || !REMIND_ID.test(String(r.id || ""))) return;
+    const text = String(r.text || "").trim();
+    const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(r.time || ""));
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(String(r.date || "")) ? r.date : "";
+    if (!text || !m || !date) return;
+    const rep = r.repeat || "once";
+    const onDay = rep === "once" ? t.day === date
+      : t.day < date ? false
+      : rep === "daily" ? true
+      : rep === "weekdays" ? t.dow >= 1 && t.dow <= 5
+      : rep === "weekly" ? t.dow === dowOf(date)
+      : false;
+    if (!onDay) return;
+    const at = Number(m[1]) * 60 + Number(m[2]);
+    if (t.min < at || t.min - at > REMIND_LATE_MIN) return;
+    // Set AFTER today's time had already passed? Then it starts next time, not right now.
+    const occurs = Date.parse(`${t.day}T00:00:00Z`) - SAST_MS + at * 60e3;
+    if (Number(r.created) > occurs) return;
+    out.push({ id: r.id, text: text.slice(0, 200), time: r.time, repeat: rep });
+  });
+  return out;
+}
+function remindPayload(r, tpls) {
+  return {
+    ...applyTpl({ title: "Reminder", body: r.text, tag: `remind-${r.id}`, url: `${APP_URL}/` }, "remind", { text: r.text, time: r.time }, tpls),
+    sticky: true,                       // stays on screen until dealt with
+    actions: [{ action: "open", title: "Open Hub" }, { action: "snooze", title: "Done" }],
+  };
+}
+const _remindLast = { at: 0, error: "" };
+async function remindSweep(now = Date.now()) {
+  const rows = (await sb("user_state?select=agent_id,data&id=eq.reminders")) || [];
+  const today = sastParts(now).day;
+  let due = 0, sent = 0;
+  let tpls = null;
+  for (const row of rows) {
+    const list = remindersDue(row && row.data && row.data.v, now);
+    for (const r of list) {
+      due++;
+      const fresh = await sb("push_log", {
+        method: "POST",
+        headers: { Prefer: "resolution=ignore-duplicates,return=representation" },
+        body: JSON.stringify([{ lead_id: `remind-${row.agent_id}-${r.id}`, kind: "remind", user_id: row.agent_id, sent_on: today }]),
+      });
+      if (!Array.isArray(fresh) || !fresh.length) continue;
+      if (!tpls) tpls = (await loadTemplates(true)).tpls;   // fresh: the owner may have just changed the wording
+      const subs = await subsFor(row.agent_id);
+      if (!subs.length) continue;
+      const out = await sendTo(subs, remindPayload(r, tpls), { urgency: "high", ttl: 3600 * 6 });
+      sent += out.sent;
+    }
+  }
+  return { people: rows.length, due, sent };
+}
+
+// "Send me this now" under each reminder — any signed-in person, to their own devices.
+const _lastRemindTest = {};
+router.post("/remind/test", async (req, res) => {
+  if (!need(res)) return;
+  try {
+    const uid = req.sentivUser || ((await userFromToken(req)) || {}).id;
+    if (!uid) return res.status(401).json({ error: "sign in first" });
+    if (_lastRemindTest[uid] && Date.now() - _lastRemindTest[uid] < 4000) return res.status(429).json({ error: "one test every few seconds" });
+    _lastRemindTest[uid] = Date.now();
+    const text = String((req.body && req.body.text) || "").trim().slice(0, 200) || "Your reminder";
+    const subs = await subsFor(uid);
+    if (!subs.length) return res.status(404).json({ error: "turn notifications on for this device first" });
+    const out = await sendTo(subs, { ...remindPayload({ id: "test", text, time: "" }, (await loadTemplates()).tpls), tag: "remind-test" }, { urgency: "high" });
+    res.json({ ok: true, devices: subs.length, ...out });
+  } catch (e) {
+    res.status(500).json({ error: e.message || "test failed" });
+  }
+});
+
+// ---- Platform watchdog (Hub v239) ----------------------------------------------------
+// Every WATCH_MS this server checks the parts that, broken, stop the team working, and
+// buzzes the owner(s) — any hour, high urgency, stays on screen — when one stays broken.
+// See watchdog.js for when it buzzes. The owner can switch it off with the "Platform
+// problem" alert's Off button in the Hub (pushTemplates.alert.off).
+//
+// What it can NOT catch: this server itself being down — then nothing here runs. That case
+// is still covered by GitHub's email from the scheduled health check.
+const { createWatchdog } = require("./watchdog");
+const WATCH_MS = num(process.env.PUSH_WATCH_MS, 5 * 60000);
+const HUB_URL = (process.env.HUB_URL || APP_URL).replace(/\/+$/, "");
+// The PUBLIC anon key — it ships in the live page. With it, private tables must read empty.
+const ANON = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVsdm1wdWdqeG56YWp2Z3ZodHpoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQyMjE2MTgsImV4cCI6MjA5OTc5NzYxOH0.BHl5AtPoU-t2pP7AzDG6IqZ2uKdJtNNZdDbW6MZtUfg";
+const SELF = () => `http://127.0.0.1:${process.env.PORT || 8787}`;
+const hhmm = (ms) => { const d = new Date(ms + SAST_MS); return `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`; };
+const forMins = (ms) => { const m = Math.max(1, Math.round(ms / 60000)); return m < 90 ? `${m} min` : `${Math.round(m / 60)} hours`; };
+
+// Pure: the watchdog's verdict for a round → what the owner's phone shows.
+function alertPayloads(ev, tpls) {
+  const out = [];
+  const t = tplFor("alert", tpls);
+  if (t.off) return out;
+  if (ev.down && ev.down.length) {
+    const one = ev.down.length === 1 ? ev.down[0] : null;
+    const problem = one ? one.label : `${ev.down.length} things are broken`;
+    const detail = one
+      ? `${one.detail || "failing"} · since ${hhmm(one.since)}${one.again ? " · still broken" : ""}`
+      : ev.down.map((d) => d.label).join(" · ");
+    out.push({
+      ...applyTpl({ title: `Sentiv needs you: ${problem}`, body: detail, tag: "platform-alert", url: `${APP_URL}/` }, "alert", { problem, detail }, tpls),
+      sticky: true, actions: [{ action: "open", title: "Open Hub" }],
+    });
+  }
+  if (ev.fixed && ev.fixed.length) {
+    const one = ev.fixed.length === 1 ? ev.fixed[0] : null;
+    out.push({
+      title: one ? `Fixed: ${one.label}` : `Fixed: ${ev.fixed.length} problems`,
+      body: one ? `Working again after ${forMins(one.downMs)}.` : ev.fixed.map((f) => f.label).join(" · "),
+      tag: "platform-fixed", url: `${APP_URL}/`, actions: [{ action: "open", title: "Open Hub" }],
+    });
+  }
+  return out;
+}
+async function notifyOwners(ev) {
+  if (!configured || !SB_URL || !SB_SERVICE) { console.warn("watchdog: cannot push", JSON.stringify(ev)); return; }
+  const tpls = (await loadTemplates(true)).tpls;
+  const list = alertPayloads(ev, tpls);
+  if (!list.length) return;
+  const owners = (await sb("profiles?select=id&role=eq.owner")) || [];
+  for (const o of owners) {
+    const subs = await subsFor(o.id);
+    for (const p of list) await sendTo(subs, p, { urgency: "high", ttl: 3600 * 12 });
+  }
+  console.log("watchdog alert", JSON.stringify({ down: (ev.down || []).map((d) => d.name), fixed: (ev.fixed || []).map((f) => f.name), owners: owners.length }));
+}
+const watch = createWatchdog({ notify: notifyOwners });
+const watchStatus = () => { const s = watch.status(); return { checkedAt: s.checkedAt ? new Date(s.checkedAt).toISOString() : null, failing: s.failing.map((f) => f.label) }; };
+
+const getJson = async (url, opts) => { const r = await fetch(url, opts); return { status: r.status, json: await r.json().catch(() => null) }; };
+const WATCH_CHECKS = [
+  { name: "hub", label: "The Hub website is down", run: async () => {
+    const r = await fetch(`${HUB_URL}/?watchdog=${Date.now()}`);
+    const t = r.ok ? await r.text() : "";
+    return { ok: r.ok && /sentiv-hub-v\d+ build/.test(t), detail: r.ok ? "page loads but has no Hub build in it" : `HTTP ${r.status}` };
+  } },
+  { name: "signin", label: "Sign-in is down", run: async () => {
+    const r = await fetch(`${SB_URL}/auth/v1/health`, { headers: { apikey: SB_SERVICE } });
+    return { ok: r.ok, detail: `Supabase sign-in HTTP ${r.status}` };
+  } },
+  { name: "database", label: "The database isn't answering", run: async () => {
+    try { await sb("profiles?select=id&limit=1"); return { ok: true }; }
+    catch (e) { return { ok: false, detail: String(e.message || e).slice(0, 120) }; }
+  } },
+  { name: "datalock", label: "Private data is open to the public", run: async () => {
+    const leaked = [];
+    for (const t of ["leads", "profiles", "team_settings", "documents", "push_subscriptions", "user_state"]) {
+      const r = await getJson(`${SB_URL}/rest/v1/${t}?select=*&limit=1`, { headers: { apikey: ANON, Authorization: `Bearer ${ANON}` } });
+      if (r.status === 200 && Array.isArray(r.json) && r.json.length) leaked.push(t);
+    }
+    return { ok: !leaked.length, detail: `public key can read: ${leaked.join(", ")}` };
+  } },
+  // An outside call (Euphoria), so every 3rd round — about every 15 minutes.
+  { name: "phones", label: "Phones (Euphoria) aren't connected", every: 3, run: async () => {
+    const r = await getJson(`${SELF()}/api/euphoria/health`);
+    const j = r.json || {};
+    if (j.auth === "not configured") return { skip: true };
+    return { ok: j.auth === "accepted", detail: String(j.auth || `HTTP ${r.status}`).slice(0, 120) };
+  } },
+];
+
+// The scheduled GitHub health check posts every result here; a failed one buzzes at once
+// (it already ran on a schedule), a passing one clears it. It proves it is OUR workflow on
+// main with a GitHub-signed token, same as the call-archive sweep — no shared secret.
+const { fromOurWorkflow } = require("./euphoria-routes");
+router.post("/alert", async (req, res) => {
+  if (!(await fromOurWorkflow(req))) return res.status(401).json({ error: "only the Sentiv health-check workflow can report problems" });
+  const results = Array.isArray(req.body && req.body.results) ? req.body.results.slice(0, 200) : [];
+  results.forEach((r) => {
+    if (!r || typeof r.name !== "string") return;
+    const name = `gh:${String(r.area || "")}:${r.name}`.slice(0, 160);
+    watch.report(name, !!r.ok, String(r.detail || "").slice(0, 160), { label: `${r.area ? r.area + ": " : ""}${r.name}`.slice(0, 120), immediate: true });
+  });
+  const out = await watch.flush();
+  res.json({ ok: true, received: results.length, alerted: (out.down || []).length, fixed: (out.fixed || []).length });
+});
+
+let _watchBusy = false, _remindBusy = false;
+async function watchTick() {
+  if (_watchBusy || !SB_URL || !SB_SERVICE) return;
+  _watchBusy = true;
+  try { await watch.run(WATCH_CHECKS); } catch (e) { console.warn("watchdog round failed", e.message); }
+  finally { _watchBusy = false; }
+}
+async function remindTick() {
+  if (_remindBusy || !configured || !SB_URL || !SB_SERVICE) return;
+  _remindBusy = true;
+  try {
+    await remindSweep();
+    _remindLast.at = Date.now(); _remindLast.error = "";
+    watch.report("reminders", true, "", { label: "Reminders aren't sending" });
+  } catch (e) {
+    _remindLast.error = String(e.message || e).slice(0, 160);
+    console.warn("reminder sweep failed", _remindLast.error);
+    watch.report("reminders", false, _remindLast.error, { label: "Reminders aren't sending" });
+    await watch.flush();
+  } finally { _remindBusy = false; }
+}
+if (!process.env.PUSH_LOOPS_OFF) {
+  if (WATCH_MS > 0) { setTimeout(watchTick, 60000).unref(); setInterval(watchTick, WATCH_MS).unref(); }
+  if (REMIND_MS > 0) setInterval(remindTick, REMIND_MS).unref();
+}
+
 // Optional in-process schedule, for when you'd rather not wire an external cron.
 // Railway keeps the web process warm, so a plain interval is enough; the quiet-hours
 // check inside /sweep is what stops it firing overnight.
@@ -890,6 +1134,10 @@ if (SWEEP_MS > 0 && SWEEP_SECRET) {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-sweep-secret": SWEEP_SECRET },
       body: "{}",
+    }).then(async (r) => {
+      const d = await r.json().catch(() => ({}));
+      watch.report("sweep", r.ok, r.ok ? "" : `HTTP ${r.status} ${String(d.error || "").slice(0, 120)}`, { label: "Follow-up alerts stopped sending", immediate: true });
+      await watch.flush();
     }).catch((e) => console.warn("scheduled sweep failed", e.message));
   }, SWEEP_MS).unref();
   console.log(`push: in-process sweep every ${Math.round(SWEEP_MS / 60000)} min`);
@@ -908,3 +1156,8 @@ module.exports._decodeImage = decodeImage;
 module.exports._quotePayload = quotePayload;
 module.exports._cellOf = cellOf;
 module.exports._rankForAgent = rankForAgent;
+module.exports._remindersDue = remindersDue;
+module.exports._remindPayload = remindPayload;
+module.exports._alertPayloads = alertPayloads;
+module.exports._watch = () => watch;
+module.exports._remindSweep = remindSweep;

@@ -1,0 +1,25 @@
+# Sentiv platform watch — every hour (Hub v239).
+# Runs the same live health check as the daily job, without the call-archive sweep. Every
+# result goes to the proxy, which pushes the owner's phone the moment something fails and
+# again when it is fixed. The proxy also checks the core parts itself every 5 minutes;
+# this hourly run adds the outside view (the data lock on every table, every locked route).
+# If the proxy itself is down nothing can push — the failed run's GitHub email still arrives.
+name: Sentiv platform watch
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  id-token: write   # proves to the proxy that the report is from this workflow
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Check the live Hub, proxy and database
+        run: node health-check.js
