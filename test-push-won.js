@@ -176,6 +176,10 @@ const sbServer = http.createServer(async (req, res) => {
   sent.length = 0;
   const pv = await call("/preview", "owner", { kind: "followup" });
   check("/preview: sends the owner the edited follow-up, sample words", pv.status === 200 && sent.length === 1 && sent[0].p.title === "Call Mthembu Logistics today", JSON.stringify(sent[0] && sent[0].p));
+  await new Promise((r) => setTimeout(r, 4100));
+  sent.length = 0;
+  await call("/preview", "owner", { kind: "stale", tpl: { title: "Draft: {company} cold {days}d", image: "../evil.jpg" } });
+  check("/preview: uses the on-screen draft, cleans a bad picture name", sent.length === 1 && sent[0].p.title === "Draft: Mthembu Logistics cold 9d" && !sent[0].p.image, JSON.stringify(sent[0] && sent[0].p));
   check("/preview: agents can't", (await call("/preview", "agent", { kind: "followup" })).status === 403);
   await new Promise((r) => setTimeout(r, 4100));
   sent.length = 0;

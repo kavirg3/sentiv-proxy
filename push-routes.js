@@ -311,7 +311,7 @@ function decodeImage(dataUrl) {
 async function storeImage(name, img) {
   const r = await fetch(`${SB_URL}/storage/v1/object/${IMG_BUCKET}/${IMG_DIR}/${name}`, {
     method: "POST",
-    headers: { apikey: SB_SERVICE, Authorization: `Bearer ${SB_SERVICE}`, "Content-Type": img.type, "x-upsert": "true", "Cache-Control": "31536000" },
+    headers: { apikey: SB_SERVICE, Authorization: `Bearer ${SB_SERVICE}`, "Content-Type": img.type, "x-upsert": "true", "cache-control": "max-age=31536000" },
     body: img.buf,
   });
   if (!r.ok) throw new Error(`picture upload failed (${r.status}) ${(await r.text()).slice(0, 200)}`);
@@ -528,8 +528,11 @@ router.post("/preview", async (req, res) => {
     _lastPreview[uid] = Date.now();
     const subs = await subsFor(uid);
     if (!subs.length) return res.status(404).json({ error: "turn notifications on for this device first" });
-    // Test what is SAVED — the Hub saves before it calls, so this is what the team gets.
-    const { tpls } = await loadTemplates(true);
+    // The Hub sends the owner's on-screen draft for this kind (it may not have reached the
+    // settings row yet); everything else is what is saved. tplFor cleans whatever arrives.
+    const saved = (await loadTemplates(true)).tpls || {};
+    const draft = req.body && req.body.tpl && typeof req.body.tpl === "object" && !Array.isArray(req.body.tpl) ? req.body.tpl : null;
+    const tpls = draft ? { ...saved, [kind]: draft } : saved;
     let payload;
     if (kind === "won") {
       let card = null;
