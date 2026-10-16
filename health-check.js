@@ -63,6 +63,7 @@ async function proxy() {
   const p = pu.json || {};
   check("Notifications", "push alerts can be sent", p.ok && p.vapid && p.supabase && p.sweep, JSON.stringify({ vapid: p.vapid, supabase: p.supabase, sweep: p.sweep }));
   check("Notifications", "deal-won alerts and editable wording are live", p.dealWon === true, String(p.dealWon));
+  check("Notifications", "chase-the-quote alerts are on", Array.isArray(p.templates) && p.templates.includes("quote"), JSON.stringify(p.templates));
   // Phones fetch notification pictures with no sign-in: the route must answer (404 for an
   // unknown picture), not 401 — and never serve a file outside its own folder.
   const pimg = await get(`${PROXY}/api/push/img/won-000000000000.jpg`);

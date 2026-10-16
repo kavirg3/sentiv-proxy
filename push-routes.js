@@ -25,6 +25,8 @@
 //   PUSH_QUIET_START     optional — hour, SAST, default 7.  No sends before this.
 //   PUSH_QUIET_END       optional — hour, SAST, default 18. No sends after this.
 //   PUSH_STALE_DAYS      optional — also nudge on deals untouched this long, default 7.
+//   PUSH_QUOTE_DAYS      optional — a Quotation Sent deal untouched this long gets the
+//                        "chase the quote" alert instead, default 5. 0 = off.
 //                        Set 0 to send follow-up alerts only.
 //   PUSH_LOG_KEEP_DAYS   optional — how long the debounce log is kept, default 30.
 //   PUSH_APP_URL         optional — where a tapped notification opens.
@@ -56,6 +58,7 @@ const APP_URL = (process.env.PUSH_APP_URL || "https://sentiv-sales-hub.pages.dev
 const QUIET_START = num(process.env.PUSH_QUIET_START, 7);
 const QUIET_END = num(process.env.PUSH_QUIET_END, 18);
 const STALE_DAYS = num(process.env.PUSH_STALE_DAYS, 7);
+const QUOTE_DAYS = num(process.env.PUSH_QUOTE_DAYS, 5);
 const LOG_KEEP_DAYS = num(process.env.PUSH_LOG_KEEP_DAYS, 30);
 // Most an agent can be buzzed in one day. The first real sweep found 97 deals deserving
 // a nudge for ONE agent — 78 of them merely going cold — which is not a notification
@@ -153,6 +156,7 @@ router.get("/health", (_req, res) => {
     sweep: !!SWEEP_SECRET,
     quietHours: `${QUIET_START}:00–${QUIET_END}:00 SAST`,
     staleDays: STALE_DAYS || "off",
+    quoteDays: QUOTE_DAYS || "off",
     appUrl: APP_URL,
     weeklyDigest: `Mondays from ${DIGEST_HOUR}:00 SAST — team numbers to the owner, own deals to everyone`,
     dealWon: true,          // v234 — /won, /image, /img, /preview
@@ -223,6 +227,7 @@ router.post("/test-user", async (req, res) => {
 const PUSH_DEFAULTS = {
   won: { title: "Deal won: {company}", body: "{value} · closed by {agent}. Team this month: {month}.", wa: "Well done {agent}! {company} signed for {value}." },
   followup: { title: "Follow-up due: {company}", body: "{stage} · {value} · {contact}" },
+  quote: { title: "Chase the quote: {company}", body: "Quoted {value} · no update for {days} days · {contact}", wa: "Hi {firstname}, just checking in on the quote we sent for {company}. Any questions I can help with?" },
   stale: { title: "Going cold: {company}", body: "{stage} · {value} · untouched {days} days" },
   week: { title: "Your week — Sentiv", body: "{todo} {lastweek}" },
   digest: { title: "Sentiv — last week's next steps", body: "{summary}" },
@@ -239,6 +244,7 @@ const IMG_BUCKET = "backups", IMG_DIR = "push-images";
 const IMG_RE = /^[a-z]+-[0-9a-f]{12}\.(jpg|png|webp)$/;
 const IMG_MAX = 1024 * 1024;
 const crypto = require("crypto");
+const waCore = require("./whatsapp-core");
 const sha12 = (s) => crypto.createHash("sha256").update(s).digest("hex").slice(0, 12);
 
 const fmtRand = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? `R${Math.round(n).toLocaleString("en-ZA")}` : ""; };
@@ -331,6 +337,7 @@ const cardName = (leadId) => `card-${sha12(`${SWEEP_SECRET || VAPID_PRIVATE}|${l
 function payloadFor(r, kind, tpls) {
   const d = r.data || {};
   const rand = typeof d.value === "number" && d.value > 0 ? ` · R${Math.round(d.value).toLocaleString("en-ZA")}` : "";
+  if (kind === "quote") return quotePayload(r, tpls);
   if (kind === "stale") {
     const days = Math.max(1, Math.round((Date.now() - Number(d.updatedAt || 0)) / 864e5));
     return applyTpl({
@@ -348,6 +355,43 @@ function payloadFor(r, kind, tpls) {
     url: `${APP_URL}/?lead=${encodeURIComponent(r.id)}`,
     leadId: r.id,
   }, "followup", { company: d.company || "a deal", stage: d.stage || "In pipeline", value: fmtRand(d.value), contact: d.contact || "" }, tpls);
+}
+
+// ---- Chase the quote (Hub v235) ------------------------------------------------------
+// A quote that has sat untouched is where deals quietly die. The alert carries a
+// "WhatsApp them" button that opens a chat with the client's cell number, the check-in
+// already typed (the owner's wording). Landlines can't take WhatsApp, so no cell = no button.
+const SA_CELL = /^27[6-8]\d{8}$/;
+function cellOf(d) {
+  const nums = [d.phone, d.directLine].concat(Array.isArray(d.contacts) ? d.contacts.map((c) => c && c.phone) : []);
+  for (const n of nums) {
+    for (const part of String(n || "").split(/[,;/]|\s{2,}/)) {
+      const c = waCore.normalizeMsisdn(part);
+      if (SA_CELL.test(c)) return c;
+    }
+  }
+  return "";
+}
+function quotePayload(r, tpls) {
+  const d = r.data || {};
+  const days = Math.max(1, Math.round((Date.now() - Number(d.updatedAt || 0)) / 864e5));
+  const vars = { company: d.company || "a deal", stage: d.stage || "Quotation Sent", value: fmtRand(d.value), days, contact: d.contact || "",
+    firstname: String(d.contact || "").trim().split(/\s+/)[0] || "there" };
+  const t = tplFor("quote", tpls);
+  const out = applyTpl({
+    title: `Chase the quote: ${vars.company}`,
+    body: `Quoted${vars.value ? " " + vars.value : ""} · no update for ${days} days`,
+    tag: `quote-${r.id}`,
+    url: `${APP_URL}/?lead=${encodeURIComponent(r.id)}`,
+    leadId: r.id,
+  }, "quote", vars, tpls);
+  const cell = cellOf(d);
+  out.actions = [{ action: "open", title: "Open lead" }];
+  if (cell) {
+    out.waUrl = `https://wa.me/${cell}?text=${encodeURIComponent(fillTpl(t.wa, vars))}`;
+    out.actions.push({ action: "wa", title: "WhatsApp them" });
+  } else out.actions.push({ action: "snooze", title: "Snooze" });
+  return out;
 }
 
 // ---- Deal won (Hub v234) -------------------------------------------------------------
@@ -512,7 +556,7 @@ router.get("/img/:file", async (req, res) => {
 
 // Owner: send yourself one message of a kind, filled with sample words, exactly as the
 // team would get it — the "Send me a test" button under each template in the Hub.
-const SAMPLE = { company: "Mthembu Logistics", value: "R84 500", agent: "Thabo", month: "R312 000", stage: "Quotation Sent", contact: "Sipho Dlamini", days: 9,
+const SAMPLE = { company: "Mthembu Logistics", value: "R84 500", agent: "Thabo", month: "R312 000", stage: "Quotation Sent", contact: "Sipho Dlamini", firstname: "Sipho", days: 9,
   todo: "This week: 2 overdue · 4 follow-ups due · 3 going cold.", lastweek: "Last week you saved 6 next steps and finished 4.",
   summary: "AI wrote 18 lines · agents saved 12 (9 from AI) · 7 marked done. Saved up 3 on the week before." };
 const _lastPreview = {};
@@ -542,6 +586,9 @@ router.post("/preview", async (req, res) => {
       const list = wonPayloads(fake, { tpls, phones: {}, card, monthTotal: 312000, agentName: SAMPLE.agent, people: [{ id: uid, role: "owner" }] });
       if (!list.length) return res.status(409).json({ error: "the deal-won message is switched off" });
       payload = { ...list[0].payload, tag: "won-preview", url: `${APP_URL}/` };
+    } else if (kind === "quote") {
+      const fake = { id: "preview", data: { company: SAMPLE.company, value: 84500, stage: "Quotation Sent", contact: SAMPLE.contact, phone: "082 555 0172", updatedAt: Date.now() - 9 * 864e5 } };
+      payload = { ...quotePayload(fake, tpls), tag: "preview-quote", url: `${APP_URL}/` };
     } else {
       const base = { tag: `preview-${kind}`, url: `${APP_URL}/`, actions: kind === "followup" || kind === "stale" ? undefined : [{ action: "open", title: "Open Hub" }] };
       payload = applyTpl({ ...base, title: PUSH_DEFAULTS[kind].title, body: "" }, kind, SAMPLE, tpls);
@@ -558,11 +605,12 @@ router.post("/preview", async (req, res) => {
 // value set sorts as 0 and falls to the back — which is what you want when 95 of 98 open
 // deals carry no figure at all. Where two deals are worth the same, the follow-up wins:
 // that one is a date the agent committed to, the other is only drifting.
+const KIND_RANK = { quote: 1, followup: 2, stale: 3 };
 const leadValue = (it) => { const v = Number(it && it.r && it.r.data && it.r.data.value); return Number.isFinite(v) ? v : 0; };
 const rankForAgent = (list) => list.slice().sort((a, b) => {
   const d = leadValue(b) - leadValue(a);
   if (d !== 0) return d;
-  if (a.kind !== b.kind) return a.kind === "followup" ? -1 : 1;
+  if (a.kind !== b.kind) return (KIND_RANK[a.kind] || 9) - (KIND_RANK[b.kind] || 9);
   return 0;
 });
 
@@ -755,6 +803,7 @@ router.post("/sweep", async (req, res) => {
     catch (e) { won = { error: e.message || "won sweep failed" }; console.warn("won sweep failed", won.error); }
     const rows = (await sb(`leads?select=id,agent_id,data`)) || [];
     const staleCutoff = STALE_DAYS > 0 ? Date.now() - STALE_DAYS * 864e5 : null;
+    const quoteCutoff = QUOTE_DAYS > 0 ? Date.now() - QUOTE_DAYS * 864e5 : null;
 
     // Two reasons to nudge. A deal that is BOTH due and going cold gets the follow-up
     // alert only: the dated one is the more actionable, and two buzzes about one deal
@@ -764,6 +813,9 @@ router.post("/sweep", async (req, res) => {
       const d = r.data || {};
       if (!r.agent_id) return;
       if (String(d.stage || "").startsWith("Closed")) return;
+      // v235 — a quote gone quiet beats the plain follow-up: same deal, sharper ask, and a
+      // button to message the client. An opted-out contact is never prompted (POPIA s11(3)).
+      if (quoteCutoff && d.stage === "Quotation Sent" && !d.optOut && Number(d.updatedAt) && Number(d.updatedAt) <= quoteCutoff) { items.push({ r, kind: "quote" }); return; }
       if (d.followUp && String(d.followUp) <= today) { items.push({ r, kind: "followup" }); return; }
       if (staleCutoff && Number(d.updatedAt) && Number(d.updatedAt) <= staleCutoff) items.push({ r, kind: "stale" });
     });
@@ -777,8 +829,11 @@ router.post("/sweep", async (req, res) => {
     // sweep runs every 15 minutes, and capping each run alone let 5 more through every
     // quarter hour — 90 buzzes to one Mac on 29/09/2026 against a cap of 5.
     const sentToday = {};
-    todayRows.forEach((r) => { if (r.kind === "followup" || r.kind === "stale") sentToday[r.user_id] = (sentToday[r.user_id] || 0) + 1; });
-    const fresh = items.filter((it) => !logged.has(`${it.r.id}|${it.kind}`));
+    todayRows.forEach((r) => { if (r.kind === "followup" || r.kind === "stale" || r.kind === "quote") sentToday[r.user_id] = (sentToday[r.user_id] || 0) + 1; });
+    // One deal alert per deal per day, whatever the reason — a deal that got its follow-up
+    // alert this morning must not buzz again as a quote alert this afternoon (v235).
+    const dealToday = new Set(todayRows.filter((r) => r.kind === "followup" || r.kind === "stale" || r.kind === "quote").map((r) => r.lead_id));
+    const fresh = items.filter((it) => !logged.has(`${it.r.id}|${it.kind}`) && !dealToday.has(it.r.id));
     if (!fresh.length) return res.json({ ok: true, due: items.length, sent: 0, note: "all already notified today", digest, won });
 
     const byAgent = {};
@@ -816,6 +871,7 @@ router.post("/sweep", async (req, res) => {
       ok: true,
       due: items.length,
       followups: fresh.filter((i) => i.kind === "followup").length,
+      quotes: fresh.filter((i) => i.kind === "quote").length,
       stale: fresh.filter((i) => i.kind === "stale").length,
       leadsNotified: notified, sent, pruned, held, maxPerAgent: MAX_PER_AGENT, digest, won,
     });
@@ -849,3 +905,6 @@ module.exports._wonPayloads = wonPayloads;
 module.exports._monthWonTotal = monthWonTotal;
 module.exports._payloadFor = payloadFor;
 module.exports._decodeImage = decodeImage;
+module.exports._quotePayload = quotePayload;
+module.exports._cellOf = cellOf;
+module.exports._rankForAgent = rankForAgent;

@@ -190,6 +190,43 @@ const sbServer = http.createServer(async (req, res) => {
   await call("/test", "agent");
   check("/test: the test template's shipped wording", sent.length === 1 && sent[0].p.title === "Sentiv Sales Hub — test" && /notifications are working/.test(sent[0].p.body), JSON.stringify(sent[0] && sent[0].p));
 
+  // ---- v235 chase the quote ----
+  const { _quotePayload: quotePayload, _cellOf: cellOf, _rankForAgent: rank } = push;
+  check("cellOf: SA cell found, landline skipped", cellOf({ phone: "011 555 0100", directLine: "082 555 0172" }) === "27825550172" && cellOf({ phone: "011 555 0100" }) === "");
+  const q = quotePayload({ id: "Q1", data: { company: "Karoo Mining", value: 120000, stage: "Quotation Sent", contact: "Sipho Dlamini", phone: "+27 82 555 0172", updatedAt: NOW - 6 * 864e5 } }, {});
+  check("quote: title", q.title === "Chase the quote: Karoo Mining", q.title);
+  check("quote: body", sp(q.body) === "Quoted R120 000 · no update for 6 days · Sipho Dlamini", q.body);
+  check("quote: WhatsApp them → client's cell, check-in typed", q.waUrl.startsWith("https://wa.me/27825550172?text=Hi%20Sipho%2C%20just%20checking%20in") && q.actions[1].title === "WhatsApp them", q.waUrl);
+  const ql = quotePayload({ id: "Q2", data: { company: "Landline Co", stage: "Quotation Sent", phone: "011 555 0100", updatedAt: NOW - 6 * 864e5 } }, {});
+  check("quote: no cell → Snooze, no WhatsApp", !ql.waUrl && ql.actions.map((x) => x.title).join() === "Open lead,Snooze" && sp(ql.body) === "Quoted · no update for 6 days", ql.body);
+  const qe = quotePayload({ id: "Q3", data: { company: "X", stage: "Quotation Sent", contact: "Jo Bloggs", phone: "0825550172", updatedAt: NOW - 6 * 864e5 } }, { quote: { title: "Quote at {company} is {days}d old", wa: "Morning {firstname}!" } });
+  check("quote: owner's wording + WhatsApp text", qe.title === "Quote at X is 6d old" && qe.waUrl.endsWith("?text=Morning%20Jo!"), JSON.stringify(qe));
+  check("rank: equal value → quote before follow-up before cold", rank([{ kind: "stale", r: { data: {} } }, { kind: "followup", r: { data: {} } }, { kind: "quote", r: { data: {} } }]).map((x) => x.kind).join() === "quote,followup,stale");
+  db.settings.pushTemplates = null;
+  db.leads.push(
+    { id: "Q10", agent_id: AGENT, data: { company: "Quiet Quote", stage: "Quotation Sent", value: 90000, phone: "0825550172", followUp: "2000-01-01", updatedAt: NOW - 6 * 864e5 } },
+    { id: "Q11", agent_id: AGENT, data: { company: "Opted Out", stage: "Quotation Sent", value: 80000, optOut: true, followUp: "2000-01-01", updatedAt: NOW - 6 * 864e5 } },
+    { id: "Q12", agent_id: AGENT, data: { company: "Fresh Quote", stage: "Quotation Sent", value: 70000, followUp: "2000-01-01", updatedAt: NOW - 2 * 864e5 } },
+  );
+  sent.length = 0;
+  const sq = await fetch(B + "/sweep", { method: "POST", headers: { "Content-Type": "application/json", "x-sweep-secret": "s3cret" }, body: "{}" }).then((r) => r.json());
+  const tagOf = (id) => (sent.find((x) => (x.p.tag || "").endsWith("-" + id)) || { p: {} }).p.tag;
+  check("sweep: quiet quote → quote alert (not follow-up)", tagOf("Q10") === "quote-Q10", `${tagOf("Q10")} ${JSON.stringify(sq.quotes)}`);
+  check("sweep: opted-out quote → plain follow-up, never 'WhatsApp them'", tagOf("Q11") === "followup-Q11");
+  check("sweep: quote touched 2 days ago → follow-up", tagOf("Q12") === "followup-Q12");
+  sent.length = 0;
+  await fetch(B + "/sweep", { method: "POST", headers: { "Content-Type": "application/json", "x-sweep-secret": "s3cret" }, body: "{}" });
+  check("sweep: not repeated the same day", !sent.some((x) => (x.p.tag || "").startsWith("quote-")));
+  // A deal that already had its follow-up alert today, then goes quiet long enough to be a quote alert.
+  db.leads.find((l) => l.id === "Q12").data.updatedAt = NOW - 6 * 864e5;
+  sent.length = 0;
+  await fetch(B + "/sweep", { method: "POST", headers: { "Content-Type": "application/json", "x-sweep-secret": "s3cret" }, body: "{}" });
+  check("sweep: a deal already alerted today is not buzzed again under another reason", !sent.some((x) => x.p.tag === "quote-Q12"));
+  await new Promise((r) => setTimeout(r, 4100));
+  sent.length = 0;
+  await call("/preview", "owner", { kind: "quote" });
+  check("/preview quote: sample with WhatsApp them", sent.length === 1 && sent[0].p.title === "Chase the quote: Mthembu Logistics" && sent[0].p.actions[1].title === "WhatsApp them", JSON.stringify(sent[0] && sent[0].p));
+
   srv.close(); sbServer.close();
   console.log(fails.length ? `\n${fails.length} FAILED` : "\nALL PASS");
   process.exit(fails.length ? 1 : 0);
