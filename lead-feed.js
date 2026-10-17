@@ -17,14 +17,14 @@ const live = process.env.LEAD_FEED_LIVE === "true" && process.env.DRY_RUN_INPUT 
     status = r.status; d = await r.json().catch(() => ({}));
   } catch (e) { d = { error: String(e.message || e) }; }
   const label = { sentiv: "Sentiv", rewards: "Digital Rewards" };
-  const lines = [`${live ? "LIVE" : "DRY RUN (no Google calls)"} — ${d.day || "?"} — target ${d.plan ? `${d.plan.perDay} new a day, ${d.plan.floor} waiting` : "?"}`];
+  const lines = [`${d.paused ? "PAUSED by the owner in the Hub (Sales Tools → Lead feed) — " : ""}${live ? "LIVE" : "DRY RUN (no Google calls)"} — ${d.day || "?"} — target ${d.plan ? `${d.plan.perDay} new a day, ${d.plan.floor} waiting` : "?"}`];
   (d.recipients || []).forEach((x) => {
     const sk = Object.entries(x.skipped || {}).map(([k, v]) => `${v} ${k}`).join(", ");
     lines.push(`${x.name || x.id} · ${label[x.biz]}: ${x.freshBefore} waiting → ${live ? `+${x.added} added (${x.cells} cell, ${x.landlines} landline)` : `would add ${x.want}`}${x.searches && x.searches.length ? ` from ${x.searches.length} searches` : ""}${sk ? ` · skipped ${sk}` : ""}`);
   });
   if (d.counts) lines.push(`Today: +${d.counts.sentiv} Sentiv, +${d.counts.rewards} Digital Rewards · uncalled now ${d.counts.freshSentiv} Sentiv, ${d.counts.freshRewards} Digital Rewards`);
   lines.push(`Google: ${d.requests ?? 0} requests (~$${d.usd ?? 0}) · quota before run ${d.quota ? `${d.quota.used}/${d.quota.limit}` : "?"}`);
-  if (live && d.short && d.short.length) lines.push(`WARN  short: ${d.short.join("; ")}`);
+  if (live && !d.paused && d.short && d.short.length) lines.push(`WARN  short: ${d.short.join("; ")}`);
   if (d.error) lines.push(`FAIL  ${d.error}`);
   console.log(`Lead feed — HTTP ${status}\n${lines.map((l) => "  " + l).join("\n")}`);
   if (process.env.GITHUB_STEP_SUMMARY) require("fs").appendFileSync(process.env.GITHUB_STEP_SUMMARY, `\n## Lead feed — ${status === 200 && d.ok && !d.error ? "✅" : "❌"}\n\n${lines.map((l) => "- " + l).join("\n")}\n`);
