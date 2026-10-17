@@ -22,6 +22,22 @@ const db = {
   settings: { pushTemplates: null, agentPhones: { [AGENT]: "+27 82 555 0172" } },
   objects: {},
 };
+// Like PostgREST: `alias:data->key` hands back that one JSON value (null if absent) and
+// nothing else; or=(…stage.not.like.Closed*) drops closed deals before they leave Supabase.
+const leadReads = [];
+const pgLeads = (rows, q) => {
+  const sel = q.get("select") || "", or = q.get("or") || "";
+  leadReads.push(sel + (q.get("id") ? "#byId" : ""));
+  if (or) {
+    if (or !== "(data->>stage.is.null,data->>stage.not.like.Closed*)") throw new Error("fake: unexpected or= " + or);
+    rows = rows.filter((r) => r.data.stage == null || !String(r.data.stage).startsWith("Closed"));
+  }
+  if (!/:data->(?!>)/.test(sel)) return rows;
+  return rows.map((r) => Object.fromEntries(sel.split(",").map((c) => {
+    const m = c.match(/^(\w+):data->(\w+)$/);
+    return m ? [m[1], r.data[m[2]] === undefined ? null : r.data[m[2]]] : [c, r[c]];
+  })));
+};
 const sbServer = http.createServer(async (req, res) => {
   const u = new URL(req.url, "http://x");
   const chunks = []; for await (const c of req) chunks.push(c);
@@ -54,7 +70,8 @@ const sbServer = http.createServer(async (req, res) => {
     let rows = db.leads;
     if (q.get("id")) rows = rows.filter((r) => r.id === q.get("id").replace("eq.", ""));
     if (q.get("data->>stage")) rows = rows.filter((r) => r.data.stage === q.get("data->>stage").replace("eq.", ""));
-    if ((q.get("select") || "").includes("closedAt:")) rows = rows.map((r) => ({ closedAt: r.data.closedAt != null ? String(r.data.closedAt) : null, value: r.data.value != null ? String(r.data.value) : null, business: r.data.business || null }));
+    if ((q.get("select") || "").includes("closedAt:data->>")) rows = rows.map((r) => ({ closedAt: r.data.closedAt != null ? String(r.data.closedAt) : null, value: r.data.value != null ? String(r.data.value) : null, business: r.data.business || null }));
+    else rows = pgLeads(rows, q);
     return json(200, rows);
   }
   if (tbl === "push_log") {
@@ -207,12 +224,16 @@ const sbServer = http.createServer(async (req, res) => {
     { id: "Q10", agent_id: AGENT, data: { company: "Quiet Quote", stage: "Quotation Sent", value: 90000, phone: "0825550172", followUp: "2000-01-01", updatedAt: NOW - 6 * 864e5 } },
     { id: "Q11", agent_id: AGENT, data: { company: "Opted Out", stage: "Quotation Sent", value: 80000, optOut: true, followUp: "2000-01-01", updatedAt: NOW - 6 * 864e5 } },
     { id: "Q12", agent_id: AGENT, data: { company: "Fresh Quote", stage: "Quotation Sent", value: 70000, followUp: "2000-01-01", updatedAt: NOW - 2 * 864e5 } },
+    { id: "Q13", agent_id: AGENT, data: { company: "Extra Contact", stage: "Quotation Sent", value: 60000, phone: "011 555 0100", contacts: [{ name: "Ann", phone: "083 555 0199" }], updatedAt: NOW - 6 * 864e5, activities: [{ note: "x".repeat(5000) }] } },
   );
   sent.length = 0;
   const sq = await fetch(B + "/sweep", { method: "POST", headers: { "Content-Type": "application/json", "x-sweep-secret": "s3cret" }, body: "{}" }).then((r) => r.json());
   const tagOf = (id) => (sent.find((x) => (x.p.tag || "").endsWith("-" + id)) || { p: {} }).p.tag;
   check("sweep: quiet quote → quote alert (not follow-up)", tagOf("Q10") === "quote-Q10", `${tagOf("Q10")} ${JSON.stringify(sq.quotes)}`);
   check("sweep: opted-out quote → plain follow-up, never 'WhatsApp them'", tagOf("Q11") === "followup-Q11");
+  const pOf = (id) => (sent.find((x) => (x.p.tag || "").endsWith("-" + id)) || { p: {} }).p;
+  check("sweep: quote alert keeps 'WhatsApp them' to the client's cell", (pOf("Q10").waUrl || "").startsWith("https://wa.me/27825550172?") && pOf("Q10").actions[1].title === "WhatsApp them", pOf("Q10").waUrl);
+  check("sweep: …and finds a cell kept on an extra contact", (pOf("Q13").waUrl || "").startsWith("https://wa.me/27835550199?") && sp(pOf("Q13").body).startsWith("Quoted R60 000 · no update for 6 days"), JSON.stringify(pOf("Q13")));
   check("sweep: quote touched 2 days ago → follow-up", tagOf("Q12") === "followup-Q12");
   sent.length = 0;
   await fetch(B + "/sweep", { method: "POST", headers: { "Content-Type": "application/json", "x-sweep-secret": "s3cret" }, body: "{}" });
@@ -227,6 +248,8 @@ const sbServer = http.createServer(async (req, res) => {
   await call("/preview", "owner", { kind: "quote" });
   check("/preview quote: sample with WhatsApp them", sent.length === 1 && sent[0].p.title === "Chase the quote: Mthembu Logistics" && sent[0].p.actions[1].title === "WhatsApp them", JSON.stringify(sent[0] && sent[0].p));
 
+  // Only /won reads a whole deal, and that is one row by id.
+  check("v245: sweep lead reads name their fields, never the whole deal", leadReads.length > 0 && leadReads.filter((x) => x.split(",").includes("data")).every((x) => x === "id,agent_id,data#byId") && leadReads.some((x) => x.includes("optOut:data->optOut")), JSON.stringify([...new Set(leadReads)]));
   srv.close(); sbServer.close();
   console.log(fails.length ? `\n${fails.length} FAILED` : "\nALL PASS");
   process.exit(fails.length ? 1 : 0);

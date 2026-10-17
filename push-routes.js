@@ -530,6 +530,22 @@ function monthWonTotal(rows, lead, now) {
   }, 0);
 }
 
+// v245 — sweep reads name the fields they use, never a whole deal: `data` also carries
+// activities and notes, and the sweep ran 96 times a day over every lead. `data->key` keeps
+// the JSON type (a number stays a number, false stays false); asLeads folds the columns back
+// into { id, agent_id, data } so every check below reads a row exactly as it did before.
+const leadCols = (keys) => ["id", "agent_id"].concat(keys.map((k) => `${k}:data->${k}`)).join(",");
+const asLeads = (rows, keys) => (rows || []).map((r) => {
+  const data = {};
+  keys.forEach((k) => { if (r[k] != null) data[k] = r[k]; });
+  return { id: r.id, agent_id: r.agent_id, data };
+});
+// Closed deals never get a sweep alert or count in the weekly note, so they stay in Supabase.
+const OPEN_ONLY = "or=(data->>stage.is.null,data->>stage.not.like.Closed*)";
+const SWEEP_KEYS = ["stage", "followUp", "updatedAt", "optOut", "value", "company", "contact", "phone", "directLine", "contacts"];
+const WEEK_KEYS = ["stage", "followUp", "updatedAt", "nextAction"];
+const WON_KEYS = ["stage", "closedAt", "business", "company", "value"];
+
 const WON_FRESH_MS = 36 * 3600e3;   // the sweep still announces a win this old (e.g. won after 18:00)
 // Announce one won deal, once. The push_log row goes in FIRST: whichever of the Hub's
 // call and the sweep gets there first sends, the other finds the row and stops.
@@ -565,7 +581,7 @@ async function sendWon(lead, today) {
 }
 
 async function wonSweep(today) {
-  const rows = (await sb(`leads?select=id,agent_id,data&data->>stage=eq.${encodeURIComponent("Closed Won")}`)) || [];
+  const rows = asLeads(await sb(`leads?select=${leadCols(WON_KEYS)}&data->>stage=eq.${encodeURIComponent("Closed Won")}`), WON_KEYS);
   const cut = Date.now() - WON_FRESH_MS;
   const recent = rows.filter((r) => r.agent_id && Number(r.data && r.data.closedAt) >= cut);
   let announced = 0;
@@ -844,7 +860,7 @@ async function agentDigests(today, to, tpls) {
   const reachable = [];
   for (const a of agents) { const subs = await subsFor(a.id); if (subs.length) reachable.push({ id: a.id, subs }); }
   if (!reachable.length) return { agents: agents.length, sent: 0, noDevice: agents.length };
-  const leads = (await sb("leads?select=id,agent_id,data")) || [];
+  const leads = asLeads(await sb(`leads?select=${leadCols(WEEK_KEYS)}&${OPEN_ONLY}`), WEEK_KEYS);
   const since = new Date(Date.now() - 7 * 864e5).toISOString();
   const events = (await sb(`usage_events?select=agent_id,kind,at&at=gte.${encodeURIComponent(since)}&kind=in.(${NEXT_KINDS.join(",")})&limit=20000`)) || [];
   let sent = 0, already = 0, nothing = 0;
@@ -910,7 +926,7 @@ router.post("/sweep", async (req, res) => {
     let won = null;
     try { won = await wonSweep(today); }
     catch (e) { won = { error: e.message || "won sweep failed" }; console.warn("won sweep failed", won.error); }
-    const rows = (await sb(`leads?select=id,agent_id,data`)) || [];
+    const rows = asLeads(await sb(`leads?select=${leadCols(SWEEP_KEYS)}&${OPEN_ONLY}`), SWEEP_KEYS);
     const K = { followup: kindRules("followup", tpls), quote: kindRules("quote", tpls), stale: kindRules("stale", tpls) };
     const staleCutoff = K.stale.off ? null : Date.now() - K.stale.days * 864e5;
     const quoteCutoff = K.quote.off ? null : Date.now() - K.quote.days * 864e5;

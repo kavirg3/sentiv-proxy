@@ -18,6 +18,22 @@ const db = {
   settings: { pushTemplates: null },
 };
 const lead = (id, agent, data) => ({ id, agent_id: agent, data: { company: id, value: 1000, ...data } });
+// Like PostgREST: `alias:data->key` hands back that one JSON value (null if absent) and
+// nothing else; or=(…stage.not.like.Closed*) drops closed deals before they leave Supabase.
+const leadReads = [];
+const pgLeads = (rows, q) => {
+  const sel = q.get("select") || "", or = q.get("or") || "";
+  leadReads.push(sel + (q.get("id") ? "#byId" : ""));
+  if (or) {
+    if (or !== "(data->>stage.is.null,data->>stage.not.like.Closed*)") throw new Error("fake: unexpected or= " + or);
+    rows = rows.filter((r) => r.data.stage == null || !String(r.data.stage).startsWith("Closed"));
+  }
+  if (!/:data->(?!>)/.test(sel)) return rows;
+  return rows.map((r) => Object.fromEntries(sel.split(",").map((c) => {
+    const m = c.match(/^(\w+):data->(\w+)$/);
+    return m ? [m[1], r.data[m[2]] === undefined ? null : r.data[m[2]]] : [c, r[c]];
+  })));
+};
 const sbServer = http.createServer(async (req, res) => {
   const u = new URL(req.url, "http://x");
   const chunks = []; for await (const c of req) chunks.push(c);
@@ -40,7 +56,7 @@ const sbServer = http.createServer(async (req, res) => {
   }
   if (tbl === "push_subscriptions") return json(200, db.subs[eq("user_id")] || []);
   if (tbl === "team_settings") return json(200, [{ pushTemplates: db.settings.pushTemplates, agentPhones: {} }]);
-  if (tbl === "leads") return json(200, q.get("data->>stage") ? db.leads.filter((r) => r.data.stage === eq("data->>stage")) : db.leads);
+  if (tbl === "leads") return json(200, pgLeads(q.get("data->>stage") ? db.leads.filter((r) => r.data.stage === eq("data->>stage")) : db.leads, q));
   if (tbl === "usage_events") return json(200, []);
   if (tbl === "user_state") return json(200, [{ agent_id: AGENT, data: { id: "reminders", v: [{ id: "r1abc", text: "x", time: "00:00", date: "2020-01-01", repeat: "daily", created: 0 }] } }]);
   if (tbl === "push_log") {
@@ -141,6 +157,12 @@ const sbServer = http.createServer(async (req, res) => {
   if (h >= 1) check("office hours 00–01 → a sweep outside them sends nothing", r.body.skipped === "quiet hours" && r.body.window === "0-1 SAST" && sent.length === 0, JSON.stringify(r.body));
   else check("office hours 00–01 (skipped: test runs inside that hour)", true);
 
+  // ---- v245: closed deals are filtered in Supabase; a deal with no stage is still open ----
+  db.leads = [lead("X1", AGENT, { stage: "Closed Lost", followUp: TODAY }), lead("X2", AGENT, { followUp: TODAY })];
+  reset(null);
+  r = await sweep();
+  check("closed deal never alerted; a deal with no stage still is", r.body.followups === 1 && sent.length === 1 && sent[0].p.title === "Follow-up due: X2", JSON.stringify(r.body));
+
   // ---- weekly notes: owner's day and hour ----
   const dow = new Date(NOW + 2 * 3600e3).getUTCDay();
   db.leads = [lead("W1", AGENT, { stage: "Lead", followUp: TODAY })];
@@ -199,6 +221,7 @@ const sbServer = http.createServer(async (req, res) => {
   check("health: shipped defaults published for the Hub", hh.defaults && hh.defaults.start === 7 && hh.defaults.end === 18 && hh.defaults.weekHour === 8);
 
   srv.close(); sbServer.close();
+  check("v245: no sweep read pulls a whole deal (data / activities)", leadReads.length > 0 && leadReads.every((x) => !x.split(",").includes("data")), JSON.stringify([...new Set(leadReads)]));
   console.log(`\n${fails.length ? `${fails.length} FAILED` : "all passed"}`);
   process.exit(fails.length ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });
