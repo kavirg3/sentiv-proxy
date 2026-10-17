@@ -24,7 +24,7 @@ const live = process.env.LEAD_FEED_LIVE === "true" && process.env.DRY_RUN_INPUT 
   });
   if (d.counts) lines.push(`Today: +${d.counts.sentiv} Sentiv, +${d.counts.rewards} Digital Rewards · uncalled now ${d.counts.freshSentiv} Sentiv, ${d.counts.freshRewards} Digital Rewards`);
   lines.push(`Google: ${d.requests ?? 0} requests (~$${d.usd ?? 0}) · quota before run ${d.quota ? `${d.quota.used}/${d.quota.limit}` : "?"}`);
-  if (d.short && d.short.length) lines.push(`WARN  short: ${d.short.join("; ")}`);
+  if (live && d.short && d.short.length) lines.push(`WARN  short: ${d.short.join("; ")}`);
   if (d.error) lines.push(`FAIL  ${d.error}`);
   console.log(`Lead feed — HTTP ${status}\n${lines.map((l) => "  " + l).join("\n")}`);
   if (process.env.GITHUB_STEP_SUMMARY) require("fs").appendFileSync(process.env.GITHUB_STEP_SUMMARY, `\n## Lead feed — ${status === 200 && d.ok && !d.error ? "✅" : "❌"}\n\n${lines.map((l) => "- " + l).join("\n")}\n`);
