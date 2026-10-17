@@ -116,6 +116,12 @@ async function database() {
     const leaked = r.status === 200 && ((Array.isArray(r.json) && r.json.length > 0) || (typeof r.json === "number" && r.json > 0));
     check("Data lock", `public key can't use ${fn}()`, !leaked, `HTTP ${r.status}`);
   }
+  // Daily lead feed (17 Oct 2026): spends Google money, so strangers and the anon key must
+  // be refused — for a run and for the counts.
+  for (const [name, body, key] of [["run", "{}", ANON], ["counts", '{"status":true}', ANON], ["forged token run", "{}", "a.b.c"]]) {
+    const r = await get(`${SB}/functions/v1/lead-feed`, { method: "POST", headers: { apikey: ANON, Authorization: `Bearer ${key}`, "Content-Type": "application/json" }, body });
+    check("Lead feed", `refuses ${name} without sign-in`, r.status === 401, `HTTP ${r.status}`);
+  }
 }
 
 (async () => {
