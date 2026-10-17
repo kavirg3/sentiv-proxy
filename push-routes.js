@@ -71,6 +71,7 @@ const MAX_PER_AGENT = num(process.env.PUSH_MAX_PER_AGENT, 5);
 
 function num(v, d) { const n = Number(v); return Number.isFinite(n) ? n : d; }
 
+const STARTED_AT = new Date().toISOString();
 const configured = !!(VAPID_PUBLIC && VAPID_PRIVATE && VAPID_SUBJECT);
 if (configured) webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE);
 
@@ -166,6 +167,7 @@ router.get("/health", (_req, res) => {
     dealWon: true,          // v234 — /won, /image, /img, /preview
     templates: PUSH_KINDS,
     // v239 — personal reminders and the platform watchdog. Names of failing checks only.
+    startedAt: STARTED_AT,      // lets the health check forgive empty loops right after a deploy
     defaults: ruleDefaults(),   // v241 — the shipped timings the Hub shows as "default"
     reminders: { every: "1 min", lastRun: _remindLast.at ? new Date(_remindLast.at).toISOString() : null, error: _remindLast.error || undefined },
     watchdog: { every: `${Math.round(WATCH_MS / 60000)} min`, ...watchStatus() },

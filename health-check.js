@@ -75,8 +75,10 @@ async function proxy() {
   check("Notifications", "push alerts can be sent", p.ok && p.vapid && p.supabase && p.sweep, JSON.stringify({ vapid: p.vapid, supabase: p.supabase, sweep: p.sweep }));
   check("Notifications", "deal-won alerts and editable wording are live", p.dealWon === true, String(p.dealWon));
   check("Notifications", "chase-the-quote alerts are on", Array.isArray(p.templates) && p.templates.includes("quote"), JSON.stringify(p.templates));
-  check("Notifications", "personal reminders are running (every minute)", !!p.reminders && !p.reminders.error && !!p.reminders.lastRun && Date.now() - Date.parse(p.reminders.lastRun) < 10 * 60e3, JSON.stringify(p.reminders));
-  check("Notifications", "the platform watchdog is running", !!p.watchdog && !!p.watchdog.checkedAt && Date.now() - Date.parse(p.watchdog.checkedAt) < 20 * 60e3, JSON.stringify(p.watchdog));
+  // Just restarted (a deploy)? The loops haven't had their first turn yet — not a fault.
+  const fresh = p.startedAt && Date.now() - Date.parse(p.startedAt) < 6 * 60e3;
+  check("Notifications", "personal reminders are running (every minute)", !!p.reminders && !p.reminders.error && (fresh || (!!p.reminders.lastRun && Date.now() - Date.parse(p.reminders.lastRun) < 10 * 60e3)), JSON.stringify(p.reminders));
+  check("Notifications", "the platform watchdog is running", !!p.watchdog && (fresh || (!!p.watchdog.checkedAt && Date.now() - Date.parse(p.watchdog.checkedAt) < 20 * 60e3)), JSON.stringify(p.watchdog));
   if (p.watchdog && Array.isArray(p.watchdog.failing) && p.watchdog.failing.length) warn("Notifications", "the watchdog sees a problem right now", p.watchdog.failing.join(" · "));
   const pal = await get(`${PROXY}/api/push/alert`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ results: [{ area: "x", name: "forged", ok: false }] }) });
   check("Notifications", "only our GitHub workflow can raise a platform alert", pal.status === 401, `HTTP ${pal.status}`);
