@@ -1,0 +1,33 @@
+# Daily lead feed — 06:30 SAST (04:30 UTC), Monday to Friday.
+# Tops each appointment setter's Lead Gen queue up to ~3 days of calls with fresh Gauteng
+# businesses (official Google Places API), via the Supabase function `lead-feed`.
+# No secret: the run proves itself with a GitHub-signed OIDC token (id-token: write).
+# Spend switch: repo variable LEAD_FEED_LIVE. Anything but "true" = dry run (plans, spends nothing).
+# Run it by hand: GitHub → Actions → "Daily lead feed" → Run workflow.
+name: Daily lead feed
+on:
+  schedule:
+    - cron: "30 4 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Plan only, no Google calls"
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  feed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Top up the setters' call lists
+        env:
+          LEAD_FEED_LIVE: ${{ vars.LEAD_FEED_LIVE }}
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+        run: node lead-feed.js
