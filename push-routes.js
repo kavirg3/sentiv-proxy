@@ -288,7 +288,27 @@ function tplFor(kind, tpls) {
     pic: o.pic === "custom" || o.pic === "none" ? o.pic : "card",
     to: o.to === "owner" ? "owner" : "all",
     off: o.off === true,
+    btns: btnsOf(o.btns),
   };
+}
+// ---- Owner-editable button names (Hub v242) -----------------------------------------
+// The words on a notification's buttons ("Open deal", "Reply in WhatsApp"), per alert,
+// keyed by what the button does: pushTemplates[kind].btns.{open,wa,snooze}. Blank = the
+// shipped name. What a button DOES stays fixed — only its name is the owner's.
+const BTN_MAX = 30;
+function btnsOf(b) {
+  const out = {};
+  if (!b || typeof b !== "object" || Array.isArray(b)) return out;
+  ["open", "wa", "snooze"].forEach((k) => {
+    const v = typeof b[k] === "string" ? b[k].replace(/\s+/g, " ").trim().slice(0, BTN_MAX) : "";
+    if (v) out[k] = v;
+  });
+  return out;
+}
+function relabel(p, kind, tpls) {
+  if (!p || !Array.isArray(p.actions)) return p;
+  const b = tplFor(kind, tpls).btns;
+  return { ...p, actions: p.actions.map((a) => (b[a.action] ? { ...a, title: b[a.action] } : a)) };
 }
 // ---- Owner-editable timing and audience (Hub v241) ----------------------------------
 // Settings → Push notifications lists every alert; the owner can switch any of them off,
@@ -330,7 +350,7 @@ function applyTpl(p, kind, vars, tpls) {
   const t = tplFor(kind, tpls);
   const out = { ...p, title: fillTpl(t.title, vars) || p.title, body: fillTpl(t.body, vars) || p.body };
   if (kind !== "won" && t.image) out.image = imgUrl(t.image);
-  return out;
+  return relabel(out, kind, tpls);
 }
 
 // The templates, read with the service key. Cached briefly: a sweep sends many messages.
@@ -379,6 +399,8 @@ async function imageExists(name) {
 // uploaded during quiet hours. Salted, so a deal id alone cannot be turned into its card.
 const cardName = (leadId) => `card-${sha12(`${SWEEP_SECRET || VAPID_PRIVATE}|${leadId}`)}.jpg`;
 
+// The service worker's own default for a deal alert, sent explicitly so it can be renamed.
+const DEAL_BTNS = () => [{ action: "open", title: "Open lead" }, { action: "snooze", title: "Snooze" }];
 // What a notification says, for each of the two reasons we send one.
 function payloadFor(r, kind, tpls) {
   const d = r.data || {};
@@ -392,6 +414,7 @@ function payloadFor(r, kind, tpls) {
       tag: `stale-${r.id}`,
       url: `${APP_URL}/?lead=${encodeURIComponent(r.id)}`,
       leadId: r.id,
+      actions: DEAL_BTNS(),
     }, "stale", { company: d.company || "a deal", stage: d.stage || "In pipeline", value: fmtRand(d.value), days }, tpls);
   }
   return applyTpl({
@@ -400,6 +423,7 @@ function payloadFor(r, kind, tpls) {
     tag: `followup-${r.id}`,          // replaces, never stacks, if it re-fires
     url: `${APP_URL}/?lead=${encodeURIComponent(r.id)}`,
     leadId: r.id,
+    actions: DEAL_BTNS(),
   }, "followup", { company: d.company || "a deal", stage: d.stage || "In pipeline", value: fmtRand(d.value), contact: d.contact || "" }, tpls);
 }
 
@@ -437,7 +461,7 @@ function quotePayload(r, tpls) {
     out.waUrl = `https://wa.me/${cell}?text=${encodeURIComponent(fillTpl(t.wa, vars))}`;
     out.actions.push({ action: "wa", title: "WhatsApp them" });
   } else out.actions.push({ action: "snooze", title: "Snooze" });
-  return out;
+  return relabel(out, "quote", tpls);
 }
 
 // ---- Deal won (Hub v234) -------------------------------------------------------------
@@ -461,7 +485,7 @@ function wonPayloads(lead, ctx) {
     const waUrl = `https://wa.me/${toCloser ? phone : ""}?text=${encodeURIComponent(waText || title)}`;
     const out = {
       title, body, tag: `won-${lead.id}`, url: `${APP_URL}/?lead=${encodeURIComponent(lead.id)}`, leadId: lead.id, waUrl,
-      actions: [{ action: "open", title: "Open deal" }, { action: "wa", title: "Reply in WhatsApp" }],
+      actions: [{ action: "open", title: t.btns.open || "Open deal" }, { action: "wa", title: t.btns.wa || "Reply in WhatsApp" }],
     };
     if (image) out.image = image;
     return { userId: p.id, payload: out };
@@ -641,6 +665,8 @@ router.post("/preview", async (req, res) => {
       const base = { tag: `preview-${kind}`, url: `${APP_URL}/`, actions: kind === "followup" || kind === "stale" ? undefined : [{ action: "open", title: "Open Hub" }] };
       payload = applyTpl({ ...base, title: PUSH_DEFAULTS[kind].title, body: "" }, kind, SAMPLE, tpls);
       if (kind === "digest") { payload.waUrl = `https://wa.me/?text=${encodeURIComponent(payload.body)}`; payload.actions = [{ action: "open", title: "Open Hub" }, { action: "wa", title: "Send to WhatsApp" }]; }
+      if (kind === "followup" || kind === "stale") payload.actions = DEAL_BTNS();
+      payload = relabel(payload, kind, tpls);
     }
     const out = await sendTo(subs, payload);
     res.json({ ok: true, devices: subs.length, ...out, image: !!payload.image });
@@ -1005,11 +1031,11 @@ function remindersDue(list, now) {
   return out;
 }
 function remindPayload(r, tpls) {
-  return {
+  return relabel({
     ...applyTpl({ title: "Reminder", body: r.text, tag: `remind-${r.id}`, url: `${APP_URL}/` }, "remind", { text: r.text, time: r.time }, tpls),
     sticky: true,                       // stays on screen until dealt with
     actions: [{ action: "open", title: "Open Hub" }, { action: "snooze", title: "Done" }],
-  };
+  }, "remind", tpls);
 }
 const _remindLast = { at: 0, error: "" };
 async function remindSweep(now = Date.now()) {
@@ -1111,10 +1137,10 @@ function alertPayloads(ev, tpls) {
     const detail = one
       ? `${one.detail || "failing"} · since ${hhmm(one.since)}${one.again ? " · still broken" : ""}`
       : ev.down.map((d) => d.label).join(" · ");
-    out.push({
+    out.push(relabel({
       ...applyTpl({ title: `Sentiv needs you: ${problem}`, body: detail, tag: "platform-alert", url: `${APP_URL}/` }, "alert", { problem, detail }, tpls),
       sticky: true, actions: [{ action: "open", title: "Open Hub" }],
-    });
+    }, "alert", tpls));
   }
   if (ev.fixed && ev.fixed.length) {
     const one = ev.fixed.length === 1 ? ev.fixed[0] : null;
@@ -1250,6 +1276,7 @@ module.exports._agentWeekPayload = agentWeekPayload;
 module.exports._fillTpl = fillTpl;
 module.exports._tplFor = tplFor;
 module.exports._applyTpl = applyTpl;
+module.exports._relabel = relabel;
 module.exports._wonPayloads = wonPayloads;
 module.exports._monthWonTotal = monthWonTotal;
 module.exports._payloadFor = payloadFor;
