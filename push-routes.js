@@ -41,6 +41,7 @@
 //   POST /api/push/image    owner uploads a notification picture
 //   GET  /api/push/img/:f   serves that picture to phones (public — content-hashed names)
 //   POST /api/push/preview  owner sends themselves one message of a kind, with sample words
+//   GET  /api/push/stats    owner: per alert, sent in the last 7 days (Settings overview)
 //   POST /api/push/remind/test  anyone: one of their own reminders, now, to their own devices
 //   POST /api/push/alert    the GitHub health-check workflow reports results (OIDC-signed)
 //   (in-process) personal reminders every minute; platform watchdog every 5 minutes
@@ -165,6 +166,7 @@ router.get("/health", (_req, res) => {
     dealWon: true,          // v234 — /won, /image, /img, /preview
     templates: PUSH_KINDS,
     // v239 — personal reminders and the platform watchdog. Names of failing checks only.
+    defaults: ruleDefaults(),   // v241 — the shipped timings the Hub shows as "default"
     reminders: { every: "1 min", lastRun: _remindLast.at ? new Date(_remindLast.at).toISOString() : null, error: _remindLast.error || undefined },
     watchdog: { every: `${Math.round(WATCH_MS / 60000)} min`, ...watchStatus() },
   });
@@ -286,6 +288,39 @@ function tplFor(kind, tpls) {
     off: o.off === true,
   };
 }
+// ---- Owner-editable timing and audience (Hub v241) ----------------------------------
+// Settings → Push notifications lists every alert; the owner can switch any of them off,
+// choose who gets it and when it fires. Stored beside the wording on the same
+// pushTemplates object: pushTemplates[kind].{off,to,days,day,hour,after,repeat}, plus the
+// shared deal-alert rules in pushTemplates.rules.{start,end,cap}. Anything missing or out
+// of range means the shipped value (the environment's, where it sets one). The Hub's
+// ALERT_RULE_DEFAULTS mirror these — keep in step.
+const TO_CHOICES = { won: ["all", "owner"], followup: ["agent", "both", "owner"], quote: ["agent", "both", "owner"], stale: ["agent", "both", "owner"], week: ["all", "owner"] };
+const DEAL_KINDS = ["followup", "quote", "stale"];
+function intIn(v, min, max, d) { const n = Number(v); return Number.isInteger(n) && n >= min && n <= max ? n : d; }
+function rulesOf(tpls) {
+  const r = (tpls && tpls.rules && typeof tpls.rules === "object") ? tpls.rules : {};
+  const start = intIn(r.start, 0, 23, QUIET_START);
+  let end = intIn(r.end, 1, 24, QUIET_END);
+  if (end <= start) end = QUIET_END > start ? QUIET_END : 24;
+  return { start, end, cap: intIn(r.cap, 1, 50, MAX_PER_AGENT) };
+}
+function kindRules(kind, tpls) {
+  const o = (tpls && tpls[kind] && typeof tpls[kind] === "object") ? tpls[kind] : {};
+  const choices = TO_CHOICES[kind];
+  const weekly = kind === "week" || kind === "digest";
+  return {
+    off: kind !== "test" && o.off === true,
+    to: choices ? (choices.includes(o.to) ? o.to : choices[0]) : null,
+    days: kind === "quote" ? intIn(o.days, 1, 60, QUOTE_DAYS > 0 ? QUOTE_DAYS : 5) : kind === "stale" ? intIn(o.days, 1, 90, STALE_DAYS > 0 ? STALE_DAYS : 7) : null,
+    day: weekly ? intIn(o.day, 0, 6, 1) : null,                 // 0 = Sunday … 1 = Monday
+    hour: weekly ? intIn(o.hour, 5, 20, DIGEST_HOUR) : null,
+    after: kind === "alert" ? intIn(o.after, 5, 120, 10) : null,   // minutes broken before the alarm
+    repeat: kind === "alert" ? intIn(o.repeat, 1, 24, 4) : null,   // hours between repeats while broken
+  };
+}
+const ruleDefaults = () => ({ start: QUIET_START, end: QUIET_END, cap: MAX_PER_AGENT, quoteDays: QUOTE_DAYS > 0 ? QUOTE_DAYS : 5, staleDays: STALE_DAYS > 0 ? STALE_DAYS : 7, weekDay: 1, weekHour: DIGEST_HOUR, alertAfter: 10, alertRepeat: 4 });
+
 const imgUrl = (file) => `${PUBLIC_URL}/api/push/img/${file}`;
 // Title, text and picture from the owner's template, over a payload that already carries
 // the shipped wording. A template that fills to nothing falls back to that wording.
@@ -515,7 +550,8 @@ router.post("/won", async (req, res) => {
       if (img && img.ext === "jpg") { try { card = await storeImage(cardName(lead.id), img); } catch (e) { console.warn(e.message); } }
     }
     const hour = sastHour();
-    if (hour < QUIET_START || hour >= QUIET_END) return res.json({ ok: true, queued: `quiet hours — goes out after ${QUIET_START}:00 SAST`, card: !!card });
+    const R = rulesOf((await loadTemplates()).tpls);
+    if (hour < R.start || hour >= R.end) return res.json({ ok: true, queued: `quiet hours — goes out after ${R.start}:00 SAST`, card: !!card });
     const out = await sendWon(lead, sastDay());
     res.json({ ok: true, ...out, card: !!card });
   } catch (e) {
@@ -713,11 +749,17 @@ function agentWeekPayload(leads, events, now, today) {
   };
 }
 
-async function weeklyDigest(today, hour, force) {
-  const dow = new Intl.DateTimeFormat("en-US", { timeZone: "Africa/Johannesburg", weekday: "short" }).format(new Date());
-  if (!force && (dow !== "Mon" || hour < DIGEST_HOUR)) return { skipped: "not Monday morning" };
+async function weeklyDigest(today, hour, force, tpls) {
+  // v241 — day, hour, on/off are the owner's (Settings → Push notifications). Each note keeps
+  // its own schedule; the guard rows below stop a second send on the same day.
+  const dow = sastParts(Date.now()).dow;
+  const Kd = kindRules("digest", tpls), Kw = kindRules("week", tpls);
+  const due = (k) => force || (dow === k.day && hour >= k.hour);
+  const agents = Kw.off ? { off: true } : due(Kw) ? await agentDigests(today, Kw.to, tpls) : { skipped: "not its day and time" };
+  if (Kd.off) return { off: true, agents };
+  if (!due(Kd)) return { skipped: "not its day and time", agents };
   const owners = (await sb("profiles?select=id&role=eq.owner")) || [];
-  if (!owners.length) return { owners: 0 };
+  if (!owners.length) return { owners: 0, agents };
   const since = new Date(Date.now() - 14 * 864e5).toISOString();
   const rows = (await sb(`usage_events?select=kind,at&at=gte.${encodeURIComponent(since)}&kind=in.(${NEXT_KINDS.join(",")})&limit=20000`)) || [];
   const payload = digestPayload(rows, Date.now());
@@ -726,7 +768,7 @@ async function weeklyDigest(today, hour, force) {
     const subs = await subsFor(o.id);
     if (!subs.length) { noDevice++; continue; }
     // The guard row goes in first; ignore-duplicates + return=representation hands back
-    // only rows that were NEW, so an empty answer means this Monday was already sent.
+    // only rows that were NEW, so an empty answer means today's was already sent.
     const fresh = await sb("push_log", {
       method: "POST",
       headers: { Prefer: "resolution=ignore-duplicates,return=representation" },
@@ -734,17 +776,17 @@ async function weeklyDigest(today, hour, force) {
     });
     if (!Array.isArray(fresh) || !fresh.length) { already++; continue; }
     const { counts, vars, ...note } = payload;
-    const out = await sendTo(subs, applyTpl(note, "digest", vars, (await loadTemplates()).tpls));
+    const out = await sendTo(subs, applyTpl(note, "digest", vars, tpls));
     sent += out.sent;
   }
-  const agents = await agentDigests(today);
   return { owners: owners.length, sent, already, noDevice, counts: payload.counts, agents };
 }
 
-async function agentDigests(today) {
+async function agentDigests(today, to, tpls) {
   // Owners too: on this team the owner works most of the deals, and the owner digest
   // above is about the TEAM, not their own book. So they get both on a Monday.
-  const agents = (await sb("profiles?select=id&role=in.(agent,owner)")) || [];
+  // v241 — "owner": the owner can keep this note to themselves.
+  const agents = (await sb(`profiles?select=id&role=${to === "owner" ? "eq.owner" : "in.(agent,owner)"}`)) || [];
   if (!agents.length) return { agents: 0 };
   // Only agents who can actually receive one are worth a leads read.
   const reachable = [];
@@ -764,7 +806,7 @@ async function agentDigests(today) {
     });
     if (!Array.isArray(fresh) || !fresh.length) { already++; continue; }
     const { counts, vars, ...note } = p;
-    const out = await sendTo(a.subs, applyTpl(note, "week", vars, (await loadTemplates()).tpls));
+    const out = await sendTo(a.subs, applyTpl(note, "week", vars, tpls || (await loadTemplates()).tpls));
     sent += out.sent;
   }
   return { agents: agents.length, reachable: reachable.length, sent, already, nothing, noDevice: agents.length - reachable.length };
@@ -792,32 +834,38 @@ router.post("/sweep", async (req, res) => {
   const given = (req.get("x-sweep-secret") || (req.body && req.body.secret) || "").trim();
   if (given !== SWEEP_SECRET) return res.status(401).json({ error: "bad sweep secret" });
 
-  // Quiet hours, in SAST regardless of where Railway happens to run the container.
-  const hour = Number(new Intl.DateTimeFormat("en-ZA", { timeZone: "Africa/Johannesburg", hour: "numeric", hour12: false }).format(new Date()));
+  // Office hours, in SAST regardless of where Railway happens to run the container.
+  // v241 — the window, the daily limit and each alert's on/off, audience and timing are the
+  // owner's (Settings → Push notifications); the environment only sets the shipped values.
+  const hour = sastHour();
   const force = !!(req.body && req.body.force);
-  if (!force && (hour < QUIET_START || hour >= QUIET_END)) {
-    return res.json({ ok: true, skipped: "quiet hours", hour, window: `${QUIET_START}-${QUIET_END} SAST` });
-  }
 
   try {
-    const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Johannesburg" }).format(new Date()); // YYYY-MM-DD
+    const today = sastDay(); // YYYY-MM-DD
+    const { tpls } = await loadTemplates(true);
+    const R = rulesOf(tpls);
     await prunePushLog(today);
-    // Never lets a digest problem stop the follow-up alerts, which matter more.
+    // The weekly notes keep the owner's own day and time, so they run before the office-hours
+    // check. A problem there never stops the deal alerts, which matter more.
     let digest = null;
-    try { digest = await weeklyDigest(today, hour, !!(req.body && req.body.digest === "force")); }
+    try { digest = await weeklyDigest(today, hour, !!(req.body && req.body.digest === "force"), tpls); }
     catch (e) { digest = { error: e.message || "digest failed" }; console.warn("weekly digest failed", digest.error); }
+    if (!force && (hour < R.start || hour >= R.end)) {
+      return res.json({ ok: true, skipped: "quiet hours", hour, window: `${R.start}-${R.end} SAST`, digest });
+    }
     // v234 — deals won since the last sweep that the Hub did not announce itself (offline,
     // or won during quiet hours). Same rule: a problem here never stops the alerts below.
     let won = null;
     try { won = await wonSweep(today); }
     catch (e) { won = { error: e.message || "won sweep failed" }; console.warn("won sweep failed", won.error); }
     const rows = (await sb(`leads?select=id,agent_id,data`)) || [];
-    const staleCutoff = STALE_DAYS > 0 ? Date.now() - STALE_DAYS * 864e5 : null;
-    const quoteCutoff = QUOTE_DAYS > 0 ? Date.now() - QUOTE_DAYS * 864e5 : null;
+    const K = { followup: kindRules("followup", tpls), quote: kindRules("quote", tpls), stale: kindRules("stale", tpls) };
+    const staleCutoff = K.stale.off ? null : Date.now() - K.stale.days * 864e5;
+    const quoteCutoff = K.quote.off ? null : Date.now() - K.quote.days * 864e5;
 
-    // Two reasons to nudge. A deal that is BOTH due and going cold gets the follow-up
-    // alert only: the dated one is the more actionable, and two buzzes about one deal
-    // in one morning is how an agent learns to ignore both.
+    // Reasons to nudge. A deal that is BOTH due and going cold gets the follow-up alert
+    // only: the dated one is the more actionable, and two buzzes about one deal in one
+    // morning is how an agent learns to ignore both.
     const items = [];
     rows.forEach((r) => {
       const d = r.data || {};
@@ -826,10 +874,21 @@ router.post("/sweep", async (req, res) => {
       // v235 — a quote gone quiet beats the plain follow-up: same deal, sharper ask, and a
       // button to message the client. An opted-out contact is never prompted (POPIA s11(3)).
       if (quoteCutoff && d.stage === "Quotation Sent" && !d.optOut && Number(d.updatedAt) && Number(d.updatedAt) <= quoteCutoff) { items.push({ r, kind: "quote" }); return; }
-      if (d.followUp && String(d.followUp) <= today) { items.push({ r, kind: "followup" }); return; }
+      if (!K.followup.off && d.followUp && String(d.followUp) <= today) { items.push({ r, kind: "followup" }); return; }
       if (staleCutoff && Number(d.updatedAt) && Number(d.updatedAt) <= staleCutoff) items.push({ r, kind: "stale" });
     });
     if (!items.length) return res.json({ ok: true, due: 0, sent: 0, digest, won });
+
+    // Who gets a deal's alert: its owner (default), its owner AND the business owner(s), or
+    // only the business owner(s) — the owner's choice per alert.
+    const owners = ((await sb("profiles?select=id&role=eq.owner")) || []).map((p) => p.id);
+    const whoGets = (kind, agentId) => {
+      const to = (K[kind] && K[kind].to) || "agent";
+      const out = new Set();
+      if (to !== "owner" && agentId) out.add(agentId);
+      if (to !== "agent") owners.forEach((o) => out.add(o));
+      return [...out];
+    };
 
     // One notification per lead per REASON per day. The guard rows are written BEFORE
     // the send, so a crash mid-sweep can't produce a second round on the retry.
@@ -837,44 +896,47 @@ router.post("/sweep", async (req, res) => {
     const logged = new Set(todayRows.map((r) => `${r.lead_id}|${r.kind}`));
     // Deal alerts ALREADY sent to each person today. The cap is per person per DAY: the
     // sweep runs every 15 minutes, and capping each run alone let 5 more through every
-    // quarter hour — 90 buzzes to one Mac on 29/09/2026 against a cap of 5.
+    // quarter hour — 90 buzzes to one Mac on 29/09/2026 against a cap of 5. A row is logged
+    // under the deal's owner; who actually received it follows from today's audience setting.
     const sentToday = {};
-    todayRows.forEach((r) => { if (r.kind === "followup" || r.kind === "stale" || r.kind === "quote") sentToday[r.user_id] = (sentToday[r.user_id] || 0) + 1; });
+    todayRows.forEach((r) => { if (DEAL_KINDS.includes(r.kind)) whoGets(r.kind, r.user_id).forEach((u) => { sentToday[u] = (sentToday[u] || 0) + 1; }); });
     // One deal alert per deal per day, whatever the reason — a deal that got its follow-up
     // alert this morning must not buzz again as a quote alert this afternoon (v235).
-    const dealToday = new Set(todayRows.filter((r) => r.kind === "followup" || r.kind === "stale" || r.kind === "quote").map((r) => r.lead_id));
+    const dealToday = new Set(todayRows.filter((r) => DEAL_KINDS.includes(r.kind)).map((r) => r.lead_id));
     const fresh = items.filter((it) => !logged.has(`${it.r.id}|${it.kind}`) && !dealToday.has(it.r.id));
     if (!fresh.length) return res.json({ ok: true, due: items.length, sent: 0, note: "all already notified today", digest, won });
 
-    const byAgent = {};
-    fresh.forEach((it) => { (byAgent[it.r.agent_id] = byAgent[it.r.agent_id] || []).push(it); });
+    const byPerson = {};
+    fresh.forEach((it) => whoGets(it.kind, it.r.agent_id).forEach((u) => { (byPerson[u] = byPerson[u] || []).push(it); }));
 
     // Cap BEFORE the push_log write, never after. The log is what suppresses a repeat
     // tomorrow, so logging a deal we deliberately did not send would bury it for good —
     // it would be marked "already notified" having never buzzed anything. Held-back
     // deals stay unlogged and come back tomorrow, once the bigger ones are cleared.
     let held = 0;
-    Object.keys(byAgent).forEach((agentId) => {
-      const ranked = rankForAgent(byAgent[agentId]);
-      const room = Math.max(0, MAX_PER_AGENT - (sentToday[agentId] || 0));
+    Object.keys(byPerson).forEach((u) => {
+      const ranked = rankForAgent(byPerson[u]);
+      const room = Math.max(0, R.cap - (sentToday[u] || 0));
       if (ranked.length > room) held += ranked.length - room;
-      byAgent[agentId] = ranked.slice(0, room);
-      if (!byAgent[agentId].length) delete byAgent[agentId];
+      byPerson[u] = ranked.slice(0, room);
+      if (!byPerson[u].length) delete byPerson[u];
     });
 
-    let sent = 0, pruned = 0, notified = 0;
-    const { tpls } = await loadTemplates(true);
-    for (const [agentId, list] of Object.entries(byAgent)) {
-      const subs = await subsFor(agentId);
-      if (!subs.length) continue;
-      await sb("push_log", {
-        method: "POST",
-        headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
-        body: JSON.stringify(list.map((it) => ({ lead_id: it.r.id, kind: it.kind, user_id: agentId, sent_on: today }))),
-      });
-      for (const it of list) {
-        const out = await sendTo(subs, payloadFor(it.r, it.kind, tpls));
-        sent += out.sent; pruned += out.pruned; notified++;
+    const plan = [];
+    for (const [u, list] of Object.entries(byPerson)) {
+      const subs = await subsFor(u);
+      if (subs.length) plan.push({ u, list, subs });
+    }
+    const toLog = new Map();
+    plan.forEach((p) => p.list.forEach((it) => toLog.set(`${it.r.id}|${it.kind}`, { lead_id: it.r.id, kind: it.kind, user_id: it.r.agent_id, sent_on: today })));
+    if (toLog.size) {
+      await sb("push_log", { method: "POST", headers: { Prefer: "resolution=ignore-duplicates,return=minimal" }, body: JSON.stringify([...toLog.values()]) });
+    }
+    let sent = 0, pruned = 0;
+    for (const p of plan) {
+      for (const it of p.list) {
+        const out = await sendTo(p.subs, payloadFor(it.r, it.kind, tpls));
+        sent += out.sent; pruned += out.pruned;
       }
     }
     res.json({
@@ -883,7 +945,7 @@ router.post("/sweep", async (req, res) => {
       followups: fresh.filter((i) => i.kind === "followup").length,
       quotes: fresh.filter((i) => i.kind === "quote").length,
       stale: fresh.filter((i) => i.kind === "stale").length,
-      leadsNotified: notified, sent, pruned, held, maxPerAgent: MAX_PER_AGENT, digest, won,
+      leadsNotified: toLog.size, sent, pruned, held, maxPerAgent: R.cap, window: `${R.start}-${R.end}`, digest, won,
     });
   } catch (e) {
     res.status(500).json({ error: e.message || "sweep failed" });
@@ -949,6 +1011,7 @@ function remindPayload(r, tpls) {
 }
 const _remindLast = { at: 0, error: "" };
 async function remindSweep(now = Date.now()) {
+  if (kindRules("remind", (await loadTemplates()).tpls).off) return { off: true };
   const rows = (await sb("user_state?select=agent_id,data&id=eq.reminders")) || [];
   const today = sastParts(now).day;
   let due = 0, sent = 0;
@@ -972,6 +1035,32 @@ async function remindSweep(now = Date.now()) {
   }
   return { people: rows.length, due, sent };
 }
+
+// ---- What went out (Hub v241) ----------------------------------------------------------
+// Owner: per alert, how many were sent in the last 7 days, to how many people, last day.
+// Read from push_log, the same rows that stop repeats. Kinds that aren't logged (tests)
+// are simply absent. "won" is one row per deal; "weekly" rows split by whose note it was.
+router.get("/stats", async (req, res) => {
+  if (!need(res)) return;
+  try {
+    const uid = req.sentivUser || ((await userFromToken(req)) || {}).id;
+    if (!uid) return res.status(401).json({ error: "sign in first" });
+    if (!(await isOwner(uid))) return res.status(403).json({ error: "owner only" });
+    const from = sastParts(Date.now() - 6 * 864e5).day;
+    const rows = (await sb(`push_log?select=lead_id,kind,user_id,sent_on&sent_on=gte.${from}&limit=20000`)) || [];
+    const kinds = {};
+    rows.forEach((r) => {
+      const k = r.kind === "weekly" ? (String(r.lead_id).startsWith("weekly-agent-") ? "week" : "digest") : r.kind;
+      const o = kinds[k] || (kinds[k] = { sent: 0, people: new Set(), last: "" });
+      o.sent++; if (r.user_id) o.people.add(r.user_id); if (r.sent_on > o.last) o.last = r.sent_on;
+    });
+    Object.keys(kinds).forEach((k) => { kinds[k].people = kinds[k].people.size; });
+    const { tpls } = await loadTemplates(true);
+    res.json({ ok: true, from, kinds, rules: rulesOf(tpls), defaults: ruleDefaults() });
+  } catch (e) {
+    res.status(500).json({ error: e.message || "stats failed" });
+  }
+});
 
 // "Send me this now" under each reminder — any signed-in person, to their own devices.
 const _lastRemindTest = {};
@@ -1041,9 +1130,14 @@ async function notifyOwners(ev) {
   const list = alertPayloads(ev, tpls);
   if (!list.length) return;
   const owners = (await sb("profiles?select=id&role=eq.owner")) || [];
+  const today = sastDay();
   for (const o of owners) {
     const subs = await subsFor(o.id);
+    if (!subs.length) continue;
     for (const p of list) await sendTo(subs, p, { urgency: "high", ttl: 3600 * 12 });
+    // Logged only so Settings can show "sent this week" — the watchdog keeps its own state.
+    try { await sb("push_log", { method: "POST", headers: { Prefer: "resolution=ignore-duplicates,return=minimal" }, body: JSON.stringify(list.map((p, i) => ({ lead_id: `alert-${Date.now()}-${i}-${o.id.slice(0, 8)}`, kind: "alert", user_id: o.id, sent_on: today }))) }); }
+    catch (e) { console.warn("alert log failed", e.message); }
   }
   console.log("watchdog alert", JSON.stringify({ down: (ev.down || []).map((d) => d.name), fixed: (ev.fixed || []).map((f) => f.name), owners: owners.length }));
 }
@@ -1102,7 +1196,12 @@ let _watchBusy = false, _remindBusy = false;
 async function watchTick() {
   if (_watchBusy || !SB_URL || !SB_SERVICE) return;
   _watchBusy = true;
-  try { await watch.run(WATCH_CHECKS); } catch (e) { console.warn("watchdog round failed", e.message); }
+  try {
+    // v241 — how long something must stay broken, and how often to repeat, are the owner's.
+    const k = kindRules("alert", (await loadTemplates()).tpls);
+    watch.configure({ failAfter: Math.max(1, Math.ceil(k.after / Math.max(1, WATCH_MS / 60000))), repeatMs: k.repeat * 3600e3 });
+    await watch.run(WATCH_CHECKS);
+  } catch (e) { console.warn("watchdog round failed", e.message); }
   finally { _watchBusy = false; }
 }
 async function remindTick() {
@@ -1157,6 +1256,8 @@ module.exports._quotePayload = quotePayload;
 module.exports._cellOf = cellOf;
 module.exports._rankForAgent = rankForAgent;
 module.exports._remindersDue = remindersDue;
+module.exports._rulesOf = rulesOf;
+module.exports._kindRules = kindRules;
 module.exports._remindPayload = remindPayload;
 module.exports._alertPayloads = alertPayloads;
 module.exports._watch = () => watch;

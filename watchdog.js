@@ -73,7 +73,13 @@ function createWatchdog({ notify, now = () => Date.now(), failAfter = 2, repeatM
     return { checkedAt, failing };
   }
 
-  return { report, flush, run, status, _state: state };
+  // The owner can change how long a problem must last and how often it repeats (v241).
+  function configure(o = {}) {
+    if (Number.isInteger(o.failAfter) && o.failAfter >= 1) failAfter = o.failAfter;
+    if (Number(o.repeatMs) > 0) repeatMs = Number(o.repeatMs);
+  }
+
+  return { report, flush, run, status, configure, _state: state };
 }
 
 module.exports = { createWatchdog };
