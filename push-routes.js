@@ -289,6 +289,7 @@ function tplFor(kind, tpls) {
     to: o.to === "owner" ? "owner" : "all",
     off: o.off === true,
     btns: btnsOf(o.btns),
+    links: linksOf(o.links),
   };
 }
 // ---- Owner-editable button names (Hub v242) -----------------------------------------
@@ -305,10 +306,32 @@ function btnsOf(b) {
   });
   return out;
 }
-function relabel(p, kind, tpls) {
+// v243 — and where a button goes: pushTemplates[kind].links.{open,wa,snooze} = a web
+// address the owner typed. Blank = the button's own job. https only, and {words} are
+// filled in (made safe for a link), e.g. https://wa.me/?text={company}.
+const LINK_MAX = 500;
+function linksOf(l) {
+  const out = {};
+  if (!l || typeof l !== "object" || Array.isArray(l)) return out;
+  ["open", "wa", "snooze"].forEach((k) => {
+    const v = typeof l[k] === "string" ? l[k].trim() : "";
+    if (v && v.length <= LINK_MAX && /^https:\/\/[^\s<>"']+$/i.test(v)) out[k] = v;
+  });
+  return out;
+}
+function relabel(p, kind, tpls, vars) {
   if (!p || !Array.isArray(p.actions)) return p;
-  const b = tplFor(kind, tpls).btns;
-  return { ...p, actions: p.actions.map((a) => (b[a.action] ? { ...a, title: b[a.action] } : a)) };
+  const t = tplFor(kind, tpls), b = t.btns;
+  const out = { ...p, actions: p.actions.map((a) => (b[a.action] ? { ...a, title: b[a.action] } : a)) };
+  const links = {};
+  out.actions.forEach((a) => {
+    const raw = t.links[a.action];
+    if (!raw) return;
+    const url = raw.replace(/\{(\w+)\}/g, (_m, k) => (vars && vars[k] != null ? encodeURIComponent(String(vars[k])) : ""));
+    if (/^https:\/\/[^\s<>"']+$/i.test(url)) links[a.action] = url;
+  });
+  if (Object.keys(links).length) out.links = links;
+  return out;
 }
 // ---- Owner-editable timing and audience (Hub v241) ----------------------------------
 // Settings → Push notifications lists every alert; the owner can switch any of them off,
@@ -350,7 +373,7 @@ function applyTpl(p, kind, vars, tpls) {
   const t = tplFor(kind, tpls);
   const out = { ...p, title: fillTpl(t.title, vars) || p.title, body: fillTpl(t.body, vars) || p.body };
   if (kind !== "won" && t.image) out.image = imgUrl(t.image);
-  return relabel(out, kind, tpls);
+  return relabel(out, kind, tpls, vars);
 }
 
 // The templates, read with the service key. Cached briefly: a sweep sends many messages.
@@ -461,7 +484,7 @@ function quotePayload(r, tpls) {
     out.waUrl = `https://wa.me/${cell}?text=${encodeURIComponent(fillTpl(t.wa, vars))}`;
     out.actions.push({ action: "wa", title: "WhatsApp them" });
   } else out.actions.push({ action: "snooze", title: "Snooze" });
-  return relabel(out, "quote", tpls);
+  return relabel(out, "quote", tpls, vars);
 }
 
 // ---- Deal won (Hub v234) -------------------------------------------------------------
@@ -485,8 +508,9 @@ function wonPayloads(lead, ctx) {
     const waUrl = `https://wa.me/${toCloser ? phone : ""}?text=${encodeURIComponent(waText || title)}`;
     const out = {
       title, body, tag: `won-${lead.id}`, url: `${APP_URL}/?lead=${encodeURIComponent(lead.id)}`, leadId: lead.id, waUrl,
-      actions: [{ action: "open", title: t.btns.open || "Open deal" }, { action: "wa", title: t.btns.wa || "Reply in WhatsApp" }],
+      actions: [{ action: "open", title: "Open deal" }, { action: "wa", title: "Reply in WhatsApp" }],
     };
+    Object.assign(out, relabel(out, "won", ctx.tpls, vars));
     if (image) out.image = image;
     return { userId: p.id, payload: out };
   });
@@ -666,7 +690,7 @@ router.post("/preview", async (req, res) => {
       payload = applyTpl({ ...base, title: PUSH_DEFAULTS[kind].title, body: "" }, kind, SAMPLE, tpls);
       if (kind === "digest") { payload.waUrl = `https://wa.me/?text=${encodeURIComponent(payload.body)}`; payload.actions = [{ action: "open", title: "Open Hub" }, { action: "wa", title: "Send to WhatsApp" }]; }
       if (kind === "followup" || kind === "stale") payload.actions = DEAL_BTNS();
-      payload = relabel(payload, kind, tpls);
+      payload = relabel(payload, kind, tpls, SAMPLE);
     }
     const out = await sendTo(subs, payload);
     res.json({ ok: true, devices: subs.length, ...out, image: !!payload.image });
@@ -1035,7 +1059,7 @@ function remindPayload(r, tpls) {
     ...applyTpl({ title: "Reminder", body: r.text, tag: `remind-${r.id}`, url: `${APP_URL}/` }, "remind", { text: r.text, time: r.time }, tpls),
     sticky: true,                       // stays on screen until dealt with
     actions: [{ action: "open", title: "Open Hub" }, { action: "snooze", title: "Done" }],
-  }, "remind", tpls);
+  }, "remind", tpls, { text: r.text, time: r.time });
 }
 const _remindLast = { at: 0, error: "" };
 async function remindSweep(now = Date.now()) {
@@ -1140,7 +1164,7 @@ function alertPayloads(ev, tpls) {
     out.push(relabel({
       ...applyTpl({ title: `Sentiv needs you: ${problem}`, body: detail, tag: "platform-alert", url: `${APP_URL}/` }, "alert", { problem, detail }, tpls),
       sticky: true, actions: [{ action: "open", title: "Open Hub" }],
-    }, "alert", tpls));
+    }, "alert", tpls, { problem, detail }));
   }
   if (ev.fixed && ev.fixed.length) {
     const one = ev.fixed.length === 1 ? ev.fixed[0] : null;

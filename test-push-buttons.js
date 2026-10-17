@@ -27,5 +27,14 @@ check("reminder: Done renamed", titles(rm) === "Open Hub | Got it", titles(rm));
 const other = R._wonPayloads(lead, { tpls: { quote: { btns: { open: "Q only" } } }, phones: {}, people })[0].payload;
 check("one alert's names don't leak to another", titles(other) === "Open deal | Reply in WhatsApp");
 
+// v243 — where a button goes
+const wl = won({ won: { links: { open: "https://example.com/deals?c={company}", wa: "https://chat.whatsapp.com/ABC123" } } });
+check("link: owner's links sent per button", wl.links && wl.links.open === "https://example.com/deals?c=Mthembu%20Logistics" && wl.links.wa === "https://chat.whatsapp.com/ABC123", JSON.stringify(wl.links));
+check("link: none set = no links field", won({}).links === undefined);
+check("link: http / javascript refused", won({ won: { links: { open: "http://x.com", wa: "javascript:alert(1)" } } }).links === undefined);
+check("link: one alert's link doesn't leak", R._payloadFor({ id: "F1", data: {} }, "followup", { won: { links: { open: "https://a.com" } } }).links === undefined);
+const fl = R._payloadFor({ id: "F1", data: { company: "Acme" } }, "followup", { followup: { links: { snooze: "https://cal.com/x" } } });
+check("link: follow-up snooze button can carry a link", fl.links && fl.links.snooze === "https://cal.com/x");
+
 console.log(fails.length ? `\n${fails.length} FAILED` : "\nall passed");
 process.exit(fails.length ? 1 : 0);
