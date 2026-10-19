@@ -26,6 +26,7 @@
 //   EUPHORIA_API_URL      optional — override for tests
 const express = require("express");
 const router = express.Router();
+const { clIndex, clMatch } = require("./client-list");
 
 const API_URL = process.env.EUPHORIA_API_URL || "https://api.euphoria.co.za/files/1010107057/api/Euphoria.Api.aspx";
 // Trimmed, quotes stripped: a key pasted with a trailing newline or wrapped in quotes is
@@ -129,6 +130,12 @@ async function originate(req, res) {
   } catch (e) { return res.status(502).json({ error: "Couldn't check your extension — try again." }); }
   const dial = saNumber(number);
   if (!dial) return res.status(400).json({ error: "Only South African numbers can be dialled from the Hub." });
+  // Hub v253 — a setter may never ring an existing Sentiv client. Checked here as well as in
+  // the Hub, so an old tab or a hand-made request cannot get round it. Owners and closers
+  // are not blocked: they look after those clients.
+  try {
+    if (await setterCallingClient(user.id, dial, company)) return res.status(403).json({ error: CLIENT_BLOCK });
+  } catch (e) { return res.status(502).json({ error: "Couldn't check the client list — try again." }); }
   const limited = overLimit(user.id);
   if (limited) return res.status(429).json({ error: limited });
   try {
@@ -139,6 +146,23 @@ async function originate(req, res) {
   } catch (e) {
     res.status(502).json({ error: `Euphoria unreachable: ${e.message}` });
   }
+}
+
+// The owner's list of existing Sentiv clients (Hub v253): team_settings row 2, salted
+// fingerprints only (see client-list.js), so the proxy can test a number without ever
+// holding the list. Re-read every 10 minutes; the owner uploads once or twice a month.
+const CLIENT_BLOCK = "Existing Sentiv client — do not call. They are already looked after by the team.";
+const CLIENT_TTL = 10 * 60e3;
+let _clients = { at: 0, idx: null };
+async function clientIndex() {
+  if (Date.now() - _clients.at < CLIENT_TTL) return _clients.idx;
+  const rows = await sbGet("team_settings?id=eq.2&select=data");
+  _clients = { at: Date.now(), idx: clIndex(rows && rows[0] && rows[0].data) };
+  return _clients.idx;
+}
+async function setterCallingClient(uid, number, company) {
+  if ((await roleOf(uid)) !== "setter") return false;
+  return !!clMatch(await clientIndex(), { company, phone: number });
 }
 
 // Can recordings be turned into something a browser plays? Checked once, with a real

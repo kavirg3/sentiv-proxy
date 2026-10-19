@@ -18,7 +18,11 @@ const euph = http.createServer((req, res) => {
   });
 });
 let ASSIGNED = null;   // team_settings.data.phoneExts, when a scenario sets it
+let ROLE = "owner";    // profiles.role of the signed-in caller
+let CLIENTS = null;    // team_settings row 2: the owner's client list (Hub v253), fingerprints only
 const sb = http.createServer((req, res) => {
+  if (req.url.startsWith("/rest/v1/profiles")) { res.writeHead(200, { "Content-Type": "application/json" }); return res.end(JSON.stringify([{ role: ROLE }])); }
+  if (req.url.startsWith("/rest/v1/team_settings?id=eq.2")) { res.writeHead(200, { "Content-Type": "application/json" }); return res.end(JSON.stringify(CLIENTS ? [{ data: CLIENTS }] : [])); }
   if (req.url.startsWith("/rest/v1/team_settings")) { res.writeHead(200, { "Content-Type": "application/json" }); return res.end(JSON.stringify(ASSIGNED ? [{ data: { phoneExts: ASSIGNED } }] : [{ data: {} }])); }
   if (req.url.startsWith("/rest/v1/user_state")) { res.writeHead(200, { "Content-Type": "application/json" }); return res.end("[]"); }
   const ok = req.url === "/auth/v1/user" && req.headers.authorization === "Bearer user-token" && req.headers.apikey === "service";
@@ -125,6 +129,39 @@ async function boot(port, env) {
     check("assigned to others but not you: refused with a plain reason", r7.status === 403 && /ask the owner/.test(r7.body.error), JSON.stringify(r7));
     s7.p.kill();
     ASSIGNED = null;
+  }
+  // 7. Hub v253: a setter can never ring an existing Sentiv client.
+  {
+    const cl = require("./client-list");
+    // Pinned against the Hub's own code: if this copy drifts from the Hub, these fail.
+    check("client-list.js makes the same fingerprints as the Hub", cl.clFp("s1", "n", "fidelity") === "18j5sl0yrmn" && cl.clNameKeys("Fidelity Services Group (Pty) Ltd").join() === "fidelity" && cl.clPhoneKeys("+27 82 555 0101").join() === "825550101");
+    const salt = "t253", keys = { n: [], p: [], d: [] };
+    cl.clRowPrints(salt, { names: ["Fidelity Services Group (Pty) Ltd"], phones: ["+27 82 555 0199"] }).forEach(([k, x]) => keys[k].push(x));
+    CLIENTS = { v: 1, salt, at: 1, count: 1, keys };
+    const s8 = await boot(4818, { ...base, EUPHORIA_API_KEY: "good-key", EUPHORIA_TENANT: "FutureLifeTech" });
+    const n8 = seen.length;
+    ROLE = "setter";
+    let r8 = await post(4818, { extension: "100", number: "082 555 0199", company: "Someone" }, "user-token");
+    check("setter: a client's number is refused 403 with the reason", r8.status === 403 && /Existing Sentiv client/.test(r8.body.error), JSON.stringify(r8));
+    r8 = await post(4818, { extension: "100", number: "0115550123", company: "FIDELITY SERVICES GROUP" }, "user-token");
+    check("setter: a client's name on another number is refused too", r8.status === 403, JSON.stringify(r8));
+    check("setter: nothing refused reached Euphoria", seen.length === n8);
+    r8 = await post(4818, { extension: "100", number: "0825550111", company: "Fresh Prospect" }, "user-token");
+    check("setter: a new prospect still rings", r8.status === 200, JSON.stringify(r8));
+    ROLE = "agent";
+    r8 = await post(4818, { extension: "100", number: "0825550199", company: "Fidelity Services Group" }, "user-token");
+    check("closer: may call an existing client", r8.status === 200, JSON.stringify(r8));
+    ROLE = "owner";
+    r8 = await post(4818, { extension: "100", number: "0825550199", company: "Fidelity Services Group" }, "user-token");
+    check("owner: may call an existing client", r8.status === 200, JSON.stringify(r8));
+    check("log never prints the client's number", !/0825550199/.test(s8.log()));
+    s8.p.kill();
+    CLIENTS = null; ROLE = "setter";
+    const s9 = await boot(4819, { ...base, EUPHORIA_API_KEY: "good-key", EUPHORIA_TENANT: "FutureLifeTech" });
+    const r9 = await post(4819, { extension: "100", number: "0825550199", company: "Fidelity Services Group" }, "user-token");
+    check("no client list uploaded: the setter's call goes through", r9.status === 200, JSON.stringify(r9));
+    s9.p.kill();
+    ROLE = "owner";
   }
   euph.close(); sb.close();
   console.log(fails.length ? `\n${fails.length} FAILED` : "\nALL PASS");
