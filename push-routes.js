@@ -165,6 +165,7 @@ router.get("/health", (_req, res) => {
     appUrl: APP_URL,
     weeklyDigest: `Mondays from ${DIGEST_HOUR}:00 SAST — team numbers to the owner, own deals to everyone`,
     dealWon: true,          // v234 — /won, /image, /img, /preview
+    cheatImages: true,      // Hub v259 — /cheat-image, /cheat-img (signed in only)
     templates: PUSH_KINDS,
     // v239 — personal reminders and the platform watchdog. Names of failing checks only.
     startedAt: STARTED_AT,      // lets the health check forgive empty loops right after a deploy
@@ -642,6 +643,54 @@ router.post("/image", async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message || "upload failed" });
   }
+});
+
+// ---- Cheat-notes pictures (Hub v259) ----
+// The owner's screenshots inside the Lead Gen cheat notes (pricing sheets, product shots).
+// Kept beside the notification pictures in the private backups bucket, but in their own
+// folder and NOT public: GET needs a signed-in Sentiv user (the /api sign-in gate in
+// server.js), because a price list is not for the world. The Hub saves only the file name,
+// as ![](img:cheat-<sha12>.jpg) inside setterKit.cheat.
+const CHEAT_DIR = "cheat-images";
+const CHEAT_RE = /^cheat-[0-9a-f]{12}\.(jpg|png|webp)$/;
+router.post("/cheat-image", async (req, res) => {
+  if (!SB_URL || !SB_SERVICE) return res.status(503).json({ error: "picture storage isn't set up on the server" });
+  try {
+    const uid = req.sentivUser || ((await userFromToken(req)) || {}).id;
+    if (!uid) return res.status(401).json({ error: "sign in first" });
+    if (!(await isOwner(uid))) return res.status(403).json({ error: "only the owner can add pictures to the cheat notes" });
+    const img = decodeImage(req.body && req.body.dataUrl);
+    if (!img) return res.status(400).json({ error: "send a JPG, PNG or WebP under 1MB" });
+    const file = `cheat-${sha12(img.buf)}.${img.ext}`;
+    const r = await fetch(`${SB_URL}/storage/v1/object/${IMG_BUCKET}/${CHEAT_DIR}/${file}`, {
+      method: "POST",
+      headers: { apikey: SB_SERVICE, Authorization: `Bearer ${SB_SERVICE}`, "Content-Type": img.type, "x-upsert": "true", "cache-control": "max-age=31536000" },
+      body: img.buf,
+    });
+    if (!r.ok) throw new Error(`picture upload failed (${r.status}) ${(await r.text()).slice(0, 200)}`);
+    res.json({ ok: true, file });
+  } catch (e) {
+    res.status(500).json({ error: e.message || "upload failed" });
+  }
+});
+const _cheatCache = new Map();
+router.get("/cheat-img/:file", async (req, res) => {
+  const file = String(req.params.file || "");
+  if (!CHEAT_RE.test(file) || !SB_URL || !SB_SERVICE) return res.status(404).end();
+  if (!req.sentivUser) return res.status(401).end();   // belt and braces: server.js already refuses
+  try {
+    let hit = _cheatCache.get(file);
+    if (!hit) {
+      const r = await fetch(`${SB_URL}/storage/v1/object/${IMG_BUCKET}/${CHEAT_DIR}/${file}`, { headers: { apikey: SB_SERVICE, Authorization: `Bearer ${SB_SERVICE}` } });
+      if (!r.ok) return res.status(404).end();
+      hit = { type: file.endsWith(".png") ? "image/png" : file.endsWith(".webp") ? "image/webp" : "image/jpeg", buf: Buffer.from(await r.arrayBuffer()) };
+      _cheatCache.set(file, hit);
+      if (_cheatCache.size > 40) _cheatCache.delete(_cheatCache.keys().next().value);
+    }
+    res.set("Content-Type", hit.type);
+    res.set("Cache-Control", "private, max-age=31536000, immutable");
+    res.send(hit.buf);
+  } catch (e) { res.status(502).end(); }
 });
 
 // Public: phones fetch a notification's picture with no sign-in. Names are content hashes,
