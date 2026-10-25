@@ -53,7 +53,7 @@ app.use((req, _res, next) => { req.sentivUser = req.get("x-user"); next(); });
 app.use("/api/boomerang", router);
 const AI_TEMPLATE = {
   name: "Whatever", type: "stamp", customFields: [{ name: "First Name", type: "FName", required: true }, { name: "Birthday", type: "DateOfBirth" }],
-  appearance: { backgroundColor: "#3B2A20", textColor: "#F5EBDD", logoImageBase64: "EVIL" }, mechanics: { stampsForReward: 8 },
+  appearance: { backgroundColor: "#3B2A20", textColor: "#f5ebdd", logoImageBase64: "EVIL", logoImageUrl: "https://x.test/a.png", activeStampColor: "brown" }, mechanics: { stampsForReward: 8 },
   description: "8 coffees, 9th free", localization: { phoneFormatCountryCode: "us" }, cardsLimit: 5, analytics: { facebookPixel: "x" },
 };
 const srv = app.listen(0, async () => {
@@ -86,6 +86,7 @@ const srv = app.listen(0, async () => {
   check("build: unique phone field added", t.customFields.some((f) => f.type === "phone" && f.unique && f.required));
   check("build: POPIA consent forced", t.legal.consentToProcessing === true && /Café Sola Gratia may keep my name/.test(t.legal.privacyPolicy.text));
   check("build: AI images and stray settings dropped", t.appearance.logoImageBase64 !== "EVIL" && t.cardsLimit === undefined && t.analytics === undefined);
+  check("build: only hex colours pass", t.appearance.textColor === "#F5EBDD" && t.appearance.backgroundColor === "#3B2A20" && t.appearance.activeStampColor === undefined && t.appearance.logoImageUrl === undefined && t.appearance.barcodeType === "qr");
   check("build: PNG logo fetched and attached", t.appearance.logoImageBase64 === Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2]).toString("base64"));
   check("build: issuer phone in +27 form", t.issuer && t.issuer.phone === "+27762946829");
   const cs = db.leads.L1.data.cardStrategy;

@@ -99,6 +99,7 @@ async function keyFor(companyId) {
 // consent are forced, and images can only come from the logo link fetched here.
 const KEEP = ["name", "type", "customFields", "appearance", "mechanics", "description", "usageDescription", "companyName",
   "localization", "expiry", "welcomeBonuses", "referralProgram", "legal", "issuer", "platforms", "installForm", "cardFace", "usefulLinks", "feedbackLinks"];
+const APPEARANCE_COLOURS = ["textColor", "backgroundColor", "activeStampColor", "inactiveStampColor", "stampBackgroundColor", "stampStrokeColor", "stampsAreaBackgroundColor"];
 const TYPES = ["stamp", "cashback", "subscription", "coupon", "discount", "certificate", "membership", "reward"];
 function cleanTemplate(t, lead) {
   const src = t && typeof t === "object" ? (t.settings && typeof t.settings === "object" ? { ...t.settings, ...t } : t) : {};
@@ -110,7 +111,10 @@ function cleanTemplate(t, lead) {
   out.companyName = company;
   if (out.appearance && typeof out.appearance === "object") {
     const a = {};
-    Object.entries(out.appearance).forEach(([k, v]) => { if (!/Base64$/.test(k) && typeof v === "string" && v.length < 40) a[k] = v; });
+    Object.entries(out.appearance).forEach(([k, v]) => {
+      if (k === "barcodeType" && (v === "qr" || v === "pdf417")) a[k] = v;
+      else if (APPEARANCE_COLOURS.includes(k) && typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v.trim())) a[k] = v.trim().toUpperCase();
+    });
     out.appearance = a;
   } else out.appearance = {};
   if (!out.appearance.barcodeType) out.appearance.barcodeType = "qr";
