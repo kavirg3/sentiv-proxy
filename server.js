@@ -36,7 +36,7 @@ const upstream = async (res, url, opts, label) => {
 app.get("/health", (_req, res) => res.json({
   ok: true,
   service: "sentiv-sales-hub-proxy",
-  routes: ["anthropic", "euphoria", "vbout", "manyreach", "repliq", "pcloud", "whatsapp", "kuration", "push"],
+  routes: ["anthropic", "euphoria", "vbout", "manyreach", "repliq", "pcloud", "whatsapp", "kuration", "push", "boomerang"],
 }));
 
 // ---- Sign-in gate (14 Oct 2026) ----------------------------------------------
@@ -58,6 +58,7 @@ const PUBLIC_ROUTES = [
   ["GET", /^\/api\/whatsapp\/webhook$/],     // Meta's verify-token handshake
   ["POST", /^\/api\/whatsapp\/webhook$/],    // HMAC over the raw body
   ["GET", /^\/api\/euphoria\/health$/],
+  ["GET", /^\/api\/boomerang\/health$/],
   ["GET", /^\/api\/euphoria\/archive\/health$/],
   ["POST", /^\/api\/euphoria\/archive\/sweep$/],  // x-archive-secret (daily GitHub Action)
 ];
@@ -97,7 +98,8 @@ app.use("/api/kuration", require("./kuration-routes"));
 app.use("/api/pcloud", require("./pcloud-routes"));
 app.use("/api/whatsapp", require("./whatsapp-routes"));
 app.use("/api/push", require("./push-routes"));
-app.use("/api/team", require("./team-routes"));   // owner invites that survive email link-scanners
+app.use("/api/team", require("./team-routes"));
+app.use("/api/boomerang", require("./boomerang-routes"));   // Digital Rewards loyalty cards (BOOMERANG_API_KEY)   // owner invites that survive email link-scanners
 
 // ---- Euphoria click-to-dial: rings the agent's extension, then the client ----
 // App sends: { extension, number, company } with the agent's Supabase token.
