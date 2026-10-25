@@ -18,10 +18,15 @@
 //   GET  /api/boomerang/companies           [{id, name}] — the agency's sub-accounts
 //   POST /api/boomerang/build               {leadId, companyId, template, summary, logoUrl, requestedAt, templateId?}
 //   POST /api/boomerang/activate            {leadId}
-// Sub-accounts themselves are created by Kavir in the Boomerang dashboard (they need the
-// client's email, a password and a tariff) — deliberately not from here.
+//   GET  /api/boomerang/tariffs             the agency's plans, for a new sub-account
+//   POST /api/boomerang/subaccounts         {name, userName, userSurname, email, phone, tariffId, tariffPeriod}
+//                                           creates a client sub-account. The password is random,
+//                                           made here and never returned or logged; the owner gets
+//                                           in with the sign-in link below, the client with "forgot password".
+//   GET  /api/boomerang/companies/:id/sso   one-hour sign-in link to that sub-account's dashboard
 // ============================================================================
 const express = require("express");
+const crypto = require("crypto");
 const router = express.Router();
 const BASE = "https://api.digitalwallet.cards/api/v2";
 const key = () => (process.env.BOOMERANG_API_KEY || "").trim();
@@ -253,6 +258,52 @@ router.post("/activate", async (req, res) => {
     await writeBack(row.id, result, null);
     res.json({ ok: true, cardStrategy: { ...cs, ...result } });
   } catch (e) { res.status(e.code && e.code < 500 ? e.code : 502).json({ error: String(e.message || e).slice(0, 400) }); }
+});
+
+router.get("/tariffs", async (req, res) => {
+  if (!(await guard(req, res))) return;
+  try {
+    const r = await bm("/tariffs?itemsPerPage=100");
+    if (!r.ok) throw new Error(bmError(r, "Listing your plans"));
+    const list = ((r.body && r.body.data) || []).map((t) => ({ id: t.id, name: t.name || `Plan ${t.id}`, currency: t.currency || "", prices: t.prices || {}, limits: t.limits || {} }));
+    res.json({ tariffs: list });
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+const PERIODS = ["trial", "month", "two_months", "quarter", "six_months", "nine_months", "year"];
+const saPhoneIntl = (p) => saPhone(p);
+router.post("/subaccounts", async (req, res) => {
+  if (!(await guard(req, res))) return;
+  const b = req.body || {};
+  const clean = (v, n = 80) => String(v == null ? "" : v).trim().slice(0, n);
+  const input = { name: clean(b.name), userName: clean(b.userName, 60), userSurname: clean(b.userSurname, 60), email: clean(b.email, 120).toLowerCase(), phone: saPhoneIntl(b.phone) };
+  const missing = Object.entries({ "business name": input.name, "first name": input.userName, "surname": input.userSurname, "email": input.email, "phone": input.phone }).filter(([, v]) => !v).map(([k]) => k);
+  if (missing.length) return res.status(400).json({ error: `Fill in: ${missing.join(", ")}.` });
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(input.email)) return res.status(400).json({ error: "That email doesn't look right." });
+  const tariffId = Number(b.tariffId);
+  if (!(tariffId > 0)) return res.status(400).json({ error: "Pick the plan for this client." });
+  const tariffPeriod = PERIODS.includes(b.tariffPeriod) ? b.tariffPeriod : "year";
+  // Random, never returned, never logged. Boomerang allows 6–20 characters.
+  const password = crypto.randomBytes(12).toString("base64").replace(/[^A-Za-z0-9]/g, "").slice(0, 14) + "a7";
+  try {
+    const r = await bm("/companies", { method: "POST", body: JSON.stringify({ ...input, tariffId, tariffPeriod, password, country: "ZA", language: "en" }) });
+    if (!r.ok || !r.body || !r.body.data) throw new Error(bmError(r, "Creating the sub-account"));
+    const c = r.body.data;
+    _companies = null;   // the next list must include it
+    _health = null;
+    res.json({ ok: true, company: { id: c.id, name: c.name || input.name, ready: !!c.apiKey } });
+  } catch (e) { res.status(502).json({ error: String(e.message || e).replace(new RegExp(password, "g"), "•••").slice(0, 400) }); }
+});
+
+router.get("/companies/:id/sso", async (req, res) => {
+  if (!(await guard(req, res))) return;
+  const id = String(req.params.id || "");
+  if (!/^\d+$/.test(id)) return res.status(400).json({ error: "Pick a sub-account first." });
+  try {
+    const r = await bm(`/companies/${id}/sso-link`);
+    if (!r.ok || !r.body || !r.body.data || !r.body.data.link) throw new Error(bmError(r, "Getting the sign-in link"));
+    res.json({ link: r.body.data.link });
+  } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
 module.exports = router;
