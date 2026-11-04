@@ -1309,6 +1309,31 @@ router.post("/alert", async (req, res) => {
   res.json({ ok: true, received: results.length, alerted: (out.down || []).length, fixed: (out.fixed || []).length });
 });
 
+// Hub v309 — the Sunday week-plan workflow reports what it planned; the owner gets one
+// notification with the week. Same proof as /alert: our workflow on main, GitHub-signed.
+function weekPlanPayload(b) {
+  const lines = (Array.isArray(b.lines) ? b.lines : []).map((x) => String(x).slice(0, 90)).slice(0, 7);
+  const who = String(b.setter || "The setter").split(" ")[0].slice(0, 40);
+  const n = Math.max(0, Number(b.planned) || 0), fresh = Math.max(0, Number(b.added) || 0);
+  if (b.skipped) return { title: "Next week was not planned", body: String(b.skipped).slice(0, 160), tag: "week-plan", url: `${APP_URL}/` };
+  return {
+    title: b.error ? `${who}'s week: ${n} planned, with a problem` : `${who}'s week is planned: ${n} leads`,
+    body: [...lines, fresh ? `${fresh} new from Google` : "", b.error ? `Problem: ${String(b.error).slice(0, 100)}` : ""].filter(Boolean).join("\n"),
+    tag: "week-plan", url: `${APP_URL}/`, actions: [{ action: "open", title: "Open Hub" }],
+  };
+}
+router.post("/weekplan", async (req, res) => {
+  if (!(await fromOurWorkflow(req))) return res.status(401).json({ error: "only the Sentiv week-plan workflow can report" });
+  if (!configured || !SB_URL || !SB_SERVICE) return res.status(503).json({ error: "push is not configured" });
+  try {
+    const payload = weekPlanPayload((req.body && typeof req.body === "object") ? req.body : {});
+    const owners = (await sb("profiles?select=id&role=eq.owner")) || [];
+    let sent = 0;
+    for (const o of owners) { const subs = await subsFor(o.id); if (subs.length) { await sendTo(subs, payload, { ttl: 3600 * 24 }); sent += subs.length; } }
+    res.json({ ok: true, owners: owners.length, devices: sent });
+  } catch (e) { res.status(500).json({ error: e.message || "week plan push failed" }); }
+});
+
 let _watchBusy = false, _remindBusy = false;
 async function watchTick() {
   if (_watchBusy || !SB_URL || !SB_SERVICE) return;
@@ -1378,5 +1403,6 @@ module.exports._rulesOf = rulesOf;
 module.exports._kindRules = kindRules;
 module.exports._remindPayload = remindPayload;
 module.exports._alertPayloads = alertPayloads;
+module.exports._weekPlanPayload = weekPlanPayload;
 module.exports._watch = () => watch;
 module.exports._remindSweep = remindSweep;

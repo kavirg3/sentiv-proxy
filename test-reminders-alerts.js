@@ -201,6 +201,17 @@ const mint = (over = {}) => {
   x = await post("/alert", { results: [{ area: "Data lock", name: "public key reads nothing from leads", ok: true }] }, mint());
   check("alert route: when it passes again, the owner gets 'Fixed'", x.body.fixed === 1 && sent.some((s) => s.to === "https://push.example/o" && /^Fixed: Data lock/.test(s.p.title)));
 
+  // Hub v309 — the Sunday week-plan workflow tells the owner what it planned.
+  x = await post("/weekplan", { planned: 5 });
+  check("weekplan route: refuses a call without our workflow's token", x.status === 401, JSON.stringify(x));
+  x = await post("/weekplan", { planned: 5 }, mint({ repository: "someone/else" }));
+  check("weekplan route: refuses another repo's workflow", x.status === 401);
+  sent.length = 0;
+  x = await post("/weekplan", { setter: "Thembi Dlamini", planned: 180, added: 12, lines: ["Mon 09/11: 90 in Benoni, for Tue 10/11 meetings", "Tue 10/11: 90 in Springs (12 new), for Wed 11/11 meetings"] }, mint());
+  const wkp = sent.find((s) => s.to === "https://push.example/o");
+  check("weekplan route: the owner gets the week", x.status === 200 && !!wkp && wkp.p.title === "Thembi's week is planned: 180 leads" && /Mon 09\/11: 90 in Benoni/.test(wkp.p.body) && /12 new from Google/.test(wkp.p.body), JSON.stringify({ x, p: wkp && wkp.p }));
+  check("weekplan route: agents are not told", !sent.some((s) => s.to === "https://push.example/a"));
+
   const hh = await fetch(`${base_}/health`).then((r) => r.json());
   check("health: reports reminders + watchdog, and the new kinds", hh.reminders && hh.watchdog && hh.templates.includes("remind") && hh.templates.includes("alert"), JSON.stringify({ r: hh.reminders, w: hh.watchdog }));
 

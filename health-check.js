@@ -82,6 +82,8 @@ async function proxy() {
   if (p.watchdog && Array.isArray(p.watchdog.failing) && p.watchdog.failing.length) warn("Notifications", "the watchdog sees a problem right now", p.watchdog.failing.join(" · "));
   const pal = await get(`${PROXY}/api/push/alert`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ results: [{ area: "x", name: "forged", ok: false }] }) });
   check("Notifications", "only our GitHub workflow can raise a platform alert", pal.status === 401, `HTTP ${pal.status}`);
+  const pwk = await get(`${PROXY}/api/push/weekplan`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planned: 1, lines: ["forged"] }) });
+  check("Notifications", "only our GitHub workflow can send the Sunday week-plan summary", pwk.status === 401, `HTTP ${pwk.status}`);
   // Phones fetch notification pictures with no sign-in: the route must answer (404 for an
   // unknown picture), not 401 — and never serve a file outside its own folder.
   const pimg = await get(`${PROXY}/api/push/img/won-000000000000.jpg`);
