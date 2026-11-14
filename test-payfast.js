@@ -24,7 +24,7 @@ const fresh = () => ({
   },
   ledger: [],
 });
-let db = fresh(); let validateAnswer = "VALID"; let ledgerOn = true; const pfCalls = [];
+let db = fresh(); let validateAnswer = "VALID"; let ledgerOn = true; const pfCalls = []; let pingStatus = 200; let formStatus = 302;
 const J = (status, body) => ({ ok: status < 300, status, json: async () => body, text: async () => (typeof body === "string" ? body : JSON.stringify(body)) });
 const fakeFetch = async (url, opts = {}) => {
   const m = (opts.method || "GET").toUpperCase();
@@ -44,6 +44,8 @@ const fakeFetch = async (url, opts = {}) => {
     return J(200, db.leads[id] ? [JSON.parse(JSON.stringify(db.leads[id]))] : []);
   }
   if (url.startsWith("https://sandbox.payfast.co.za/eng/query/validate")) { pfCalls.push({ url, body: opts.body }); return J(200, validateAnswer); }
+  if (url.startsWith("https://api.payfast.co.za/ping")) return J(pingStatus, "PayFast API");
+  if (url.startsWith("https://sandbox.payfast.co.za/eng/process")) return J(formStatus, "");
   if (url.startsWith("https://api.payfast.co.za/subscriptions/")) { pfCalls.push({ url, m, headers: opts.headers }); return /tok-bad/.test(url) ? J(400, { data: { message: "not found" } }) : J(200, { status: "success" }); }
   if (url.startsWith("https://www.payfast.co.za")) { pfCalls.push({ url, live: true }); return J(200, "VALID"); }
   return J(404, {});
@@ -78,6 +80,11 @@ const srv = app.listen(0, async () => {
   // ---- health ----
   const h = await (await fetch(base + "/health")).json();
   check("health: configured, sandbox, ledger up, no key in the answer", h.ok && h.sandbox === true && h.ledger === true && !/46f0cd|jt7NOE|10000100/.test(JSON.stringify(h)), JSON.stringify(h));
+
+  check("health: PayFast accepts the keys (API ping + signed form)", h.auth === "accepted" && h.form === "accepted");
+  router._resetProof(); pingStatus = 401; formStatus = 400;
+  { const hb = await (await fetch(base + "/health")).json(); check("health: refused keys are reported, ok goes false", hb.ok === false && hb.auth === "refused" && hb.form === "refused" && hb.configured === true, JSON.stringify(hb)); }
+  router._resetProof(); pingStatus = 200; formStatus = 302;
 
   // ---- the invoice page ----
   let p = await page(`/i/L1/inv_1/${KEY1}`);

@@ -97,6 +97,7 @@ async function proxy() {
   if (pf.status === 200 && !pfj.configured) warn("Invoices", "card payments are OFF", "PAYFAST_MERCHANT_ID / _KEY / _PASSPHRASE not set on Railway");
   if (pf.status === 200 && pfj.sandbox) warn("Invoices", "Payfast is in TEST mode", "PAYFAST_SANDBOX is set on Railway — no real money moves");
   if (pf.status === 200 && pfj.configured && !pfj.ledger) warn("Invoices", "the payment log is missing", "apply supabase-migration-rw-payments.sql");
+  if (pfj.configured) check("Invoices", "Payfast accepts our keys", pfj.auth !== "refused" && pfj.form !== "refused", `ping ${pfj.auth} · form ${pfj.form}`);
   const pfi = await get(`${PROXY}/api/payfast/i/nobody/nothing/0000000000000000`);
   check("Invoices", "an invoice link with the wrong key opens nothing", pfi.status === 404, `HTTP ${pfi.status}`);
 

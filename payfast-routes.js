@@ -279,9 +279,38 @@ const safe = (fn, onError) => (req, res) => Promise.resolve().then(() => fn(req,
   console.warn(`[payfast] ${req.method} ${req.path.split("/").slice(0, 2).join("/")} failed: ${String((e && e.message) || e).slice(0, 200)}`);
   if (!res.headersSent) onError(res);
 });
-router.get("/health", safe(async (_req, res) => {
+// Do the keys actually work? Two harmless questions to PayFast, asked at most every 10 minutes:
+//   auth — the API ping, signed with the merchant ID + passphrase;
+//   form — a signed R5 payment form (merchant ID + key + passphrase). PayFast answers with a
+//          redirect to its pay page when it accepts the signature; nobody is charged.
+let _proof = null;
+async function keyProof(req) {
+  if (_proof && _proof.until > Date.now()) return _proof.out;
+  const c = cfg(); const out = { auth: "unreachable", form: "unreachable" };
+  try {
+    const d = new Date(Date.now() + 2 * 3600e3);
+    const headers = { "merchant-id": c.id, version: "v1", timestamp: `${d.toISOString().slice(0, 19)}+0200` };
+    headers.signature = signApi(headers, c.pass);
+    const r = await _fetch(`https://api.payfast.co.za/ping${c.sandbox ? "?testing=true" : ""}`, { headers });
+    out.auth = r.status === 200 ? "accepted" : r.status === 401 || r.status === 400 ? "refused" : `http ${r.status}`;
+  } catch (_) { /* unreachable */ }
+  try {
+    const pairs = [["merchant_id", c.id], ["merchant_key", c.key], ["return_url", `${publicUrl(req)}/health`], ["cancel_url", `${publicUrl(req)}/health`],
+      ["m_payment_id", "connection-check"], ["amount", "5.00"], ["item_name", "Connection check"]];
+    const body = new URLSearchParams([...pairs, ["signature", signForm(pairs, c.pass)]]);
+    const r = await _fetch(`${pfHost()}/eng/process`, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body, redirect: "manual" });
+    out.form = r.status >= 300 && r.status < 400 ? "accepted" : r.status === 400 ? "refused" : `http ${r.status}`;
+  } catch (_) { /* unreachable */ }
+  const settled = out.auth !== "unreachable" && out.form !== "unreachable";
+  _proof = { out, until: Date.now() + (settled ? 10 : 1) * 60e3 };
+  return out;
+}
+router._resetProof = () => { _proof = null; };
+
+router.get("/health", safe(async (req, res) => {
   const c = cfg();
-  res.json({ ok: configured(), configured: configured(), sandbox: c.sandbox, ledger: SB_URL() && SB_SERVICE() ? await ledgerUp() : false,
+  const proof = configured() ? await keyProof(req) : {};
+  res.json({ ok: configured() && proof.auth !== "refused" && proof.form !== "refused", configured: configured(), sandbox: c.sandbox, ledger: SB_URL() && SB_SERVICE() ? await ledgerUp() : false, ...proof,
     ...(configured() ? {} : { error: "PayFast keys are not set on the server yet." }) });
 }, (res) => res.json({ ok: false, configured: configured(), sandbox: cfg().sandbox, ledger: false })));
 
