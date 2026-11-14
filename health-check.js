@@ -46,7 +46,7 @@ async function proxy() {
   const closed = [["POST", "/api/pcloud/list"], ["POST", "/api/pcloud/fetch"], ["POST", "/api/anthropic"], ["GET", "/api/kuration/projects"],
     ["POST", "/api/kuration/rows"], ["POST", "/api/team/invite"], ["GET", "/api/euphoria/calls"], ["POST", "/api/euphoria-originate"],
     ["POST", "/api/vbout-contact"], ["POST", "/api/manyreach-enroll"], ["POST", "/api/repliq-generate"], ["POST", "/api/push/test"], ["POST", "/api/push/remind/test"], ["GET", "/api/push/stats"],
-    ["POST", "/api/euphoria/archive/sync"], ["GET", "/api/euphoria/archive/play/1"], ["GET", "/api/euphoria/archive/list"]];
+    ["POST", "/api/euphoria/archive/sync"], ["GET", "/api/euphoria/archive/play/1"], ["GET", "/api/euphoria/archive/list"], ["POST", "/api/payfast/cancel"]];
   for (const [m, p] of closed) {
     const r = await get(`${PROXY}${p}`, { method: m, headers: { "Content-Type": "application/json" }, body: m === "GET" ? undefined : "{}" });
     check("Server lock", `${m} ${p} refuses strangers`, r.status === 401, `HTTP ${r.status}`);
@@ -89,6 +89,17 @@ async function proxy() {
   const pimg = await get(`${PROXY}/api/push/img/won-000000000000.jpg`);
   check("Notifications", "notification pictures are reachable by phones", pimg.status === 404, `HTTP ${pimg.status}`);
 
+  // Digital Rewards invoices: the client's invoice page is public but opens only with the
+  // invoice's own secret key; card payments need the PAYFAST_* keys and the rw_payments table.
+  const pf = await get(`${PROXY}/api/payfast/health`);
+  const pfj = pf.json || {};
+  check("Invoices", "Payfast route is up", pf.status === 200, `HTTP ${pf.status}`);
+  if (pf.status === 200 && !pfj.configured) warn("Invoices", "card payments are OFF", "PAYFAST_MERCHANT_ID / _KEY / _PASSPHRASE not set on Railway");
+  if (pf.status === 200 && pfj.sandbox) warn("Invoices", "Payfast is in TEST mode", "PAYFAST_SANDBOX is set on Railway — no real money moves");
+  if (pf.status === 200 && pfj.configured && !pfj.ledger) warn("Invoices", "the payment log is missing", "apply supabase-migration-rw-payments.sql");
+  const pfi = await get(`${PROXY}/api/payfast/i/nobody/nothing/0000000000000000`);
+  check("Invoices", "an invoice link with the wrong key opens nothing", pfi.status === 404, `HTTP ${pfi.status}`);
+
   const ku = await get(`${PROXY}/api/kuration/health`);
   check("Lead research", "Kuration route is up", ku.status === 200, `HTTP ${ku.status}`);
   const wa = await get(`${PROXY}/api/whatsapp/health`);
@@ -107,7 +118,7 @@ async function database() {
   // security rule was dropped or loosened.
   const tables = ["leads", "documents", "profiles", "team_settings", "user_state", "usage_events", "spend_events", "wa_inbound", "tenders",
     "tender_chunks", "recordings", "todos", "referrals", "partners", "network", "meetings", "push_subscriptions", "push_log", "deleted_rows",
-    "places_usage", "company_registry"];
+    "places_usage", "company_registry", "rw_payments"];
   for (const t of tables) {
     const r = await get(`${SB}/rest/v1/${t}?select=*&limit=1`, { headers: { apikey: ANON, Authorization: `Bearer ${ANON}` } });
     const leaked = r.status === 200 && Array.isArray(r.json) && r.json.length > 0;
