@@ -12,6 +12,9 @@ const app = express();
 // same bytes (unicode escapes and key order differ), so every signature would fail in a
 // way that looks exactly like a wrong secret.
 app.use(express.json({ limit: "2mb", verify: (req, _res, buf) => { req.rawBody = buf; } }));
+// The Digital Rewards website posts its lead form from its own address, so this one path
+// answers that site's browser check (WEBLEAD_ORIGINS) whatever ALLOWED_ORIGINS says.
+app.use("/api/rewards/web-lead", cors({ origin: (req, cb) => cb(null, require("./weblead-routes").origins()), methods: ["POST"] }));
 app.use(cors({ origin: (process.env.ALLOWED_ORIGINS || "*").split(",") }));
 
 const need = (res, pairs) => {
@@ -63,6 +66,8 @@ const PUBLIC_ROUTES = [
   ["GET", /^\/api\/payfast\/health$/],
   ["GET", /^\/api\/payfast\/i\/[^/]+\/[^/]+\/[0-9a-f]{16,64}$/],   // the client's invoice page — opened by its secret key
   ["POST", /^\/api\/payfast\/itn$/],        // PayFast's payment notice: signature + PayFast's own confirmation
+  ["GET", /^\/api\/rewards\/health$/],
+  ["POST", /^\/api\/rewards\/web-lead$/],   // the Digital Rewards website form: origin list + honeypot + limits (weblead-routes.js)
   ["GET", /^\/api\/euphoria\/archive\/health$/],
   ["POST", /^\/api\/euphoria\/archive\/sweep$/],  // x-archive-secret (daily GitHub Action)
 ];
@@ -104,6 +109,7 @@ app.use("/api/whatsapp", require("./whatsapp-routes"));
 app.use("/api/push", require("./push-routes"));
 app.use("/api/team", require("./team-routes"));
 app.use("/api/payfast", require("./payfast-routes"));       // Digital Rewards invoices + card payments (PAYFAST_* keys)
+app.use("/api/rewards", require("./weblead-routes"));       // Digital Rewards website form → Hub leads (WEBLEAD_ORIGINS)
 app.use("/api/boomerang", require("./boomerang-routes"));   // Digital Rewards loyalty cards (BOOMERANG_API_KEY)   // owner invites that survive email link-scanners
 
 // ---- Euphoria click-to-dial: rings the agent's extension, then the client ----

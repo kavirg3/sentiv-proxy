@@ -101,6 +101,20 @@ async function proxy() {
   const pfi = await get(`${PROXY}/api/payfast/i/nobody/nothing/0000000000000000`);
   check("Invoices", "an invoice link with the wrong key opens nothing", pfi.status === 404, `HTTP ${pfi.status}`);
 
+  // Digital Rewards website form: public by design, so it must refuse other websites and
+  // bare scripts (no Origin) and must not save anything for them.
+  const wl = await get(`${PROXY}/api/rewards/health`);
+  const wlj = (wl.json && wl.json.webLead) || {};
+  check("Website form", "web-lead route is up", wl.status === 200, `HTTP ${wl.status}`);
+  if (wl.status === 200 && !wlj.open) warn("Website form", "the website form is OFF", "WEBLEAD_ORIGINS not set on Railway");
+  const wlPost = (origin) => get(`${PROXY}/api/rewards/web-lead`, { method: "POST", headers: { "Content-Type": "application/json", ...(origin ? { Origin: origin } : {}) },
+    body: JSON.stringify({ name: "Health Check", business: "Health Check", type: "Other", branches: 1, email: "health@example.com", whatsapp: "0820000000", consent: "on" }) });
+  const wlRefused = (r) => r.status === 403 || r.status === 503;
+  const wl1 = await wlPost("https://not-our-website.example");
+  check("Website form", "another website cannot post a lead", wlRefused(wl1), `HTTP ${wl1.status}`);
+  const wl2 = await wlPost("");
+  check("Website form", "a script with no website cannot post a lead", wlRefused(wl2), `HTTP ${wl2.status}`);
+
   const ku = await get(`${PROXY}/api/kuration/health`);
   check("Lead research", "Kuration route is up", ku.status === 200, `HTTP ${ku.status}`);
   const wa = await get(`${PROXY}/api/whatsapp/health`);
