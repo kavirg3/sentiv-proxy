@@ -39,6 +39,7 @@ const good = (o = {}) => ({ name: "  Thandi   Mokoena ", business: "Café <b>Sol
   check("email lower-cased, phone in Hub format", b.email === "thandi@cafe.test" && b.phone === "082 123 4567");
   check("follow-up is today in SAST", b.followUp === "2026-11-15", b.followUp);
   check("consent recorded with where and when", b.consentBasis === "consent" && b.consentSource.includes("/contact.html") && b.consentSource.includes("15/11/2026"));
+  check("goes to the top of the call list, newest first", b.callRank < 0 && buildWebLead(good(), now + 60e3).lead.callRank < b.callRank);
   check("kept for three years", b.retainUntil === "2029-11-15", b.retainUntil);
   check("notes carry branches and challenge on one line", b.notes === "Website enquiry · 2 branches · Challenge: Customers visit once and never return", b.notes);
   check("extra fields from the browser are dropped", !("role" in b) && !("agent_id" in b) && !("website" in b) && !("consent" in b));

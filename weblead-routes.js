@@ -71,6 +71,9 @@ function buildWebLead(body, now) {
     consentBasis: "consent", consentSource: `Website form${page ? ` (${page})` : ""}, ${dmy(day)} — ticked the POPIA consent box`,
     retainUntil: `${ret.getUTCFullYear()}-${pad(ret.getUTCMonth() + 1)}-${pad(ret.getUTCDate())}`,
     webLead: { at: now, page },
+    // Someone who asked to be called goes to the TOP of Up next: ranked leads come first,
+    // lowest rank first (Hub v246), so a negative rank that falls with time puts the newest enquiry first.
+    callRank: -Math.floor(now / 1000),
     business: "rewards",
   };
   return { lead };
