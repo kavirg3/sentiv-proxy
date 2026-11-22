@@ -12,7 +12,10 @@ const J = (status, body) => ({ ok: status < 300, status, json: async () => body,
 router._setFetch(async (url, opts = {}) => {
   const m = (opts.method || "GET").toUpperCase(); calls.push(`${m} ${url}`);
   if (opts.headers.apikey !== "SVC") return J(401, {});
+  if (url.includes("/rest/v1/profiles?id=eq.")) return J(200, url.includes("id=eq.u-owner") ? [{ role: "owner" }] : [{ role: "agent" }]);
   if (url.includes("/rest/v1/profiles")) return J(200, ownerRows);
+  if (url.endsWith("/storage/v1/object/list/backups") && m === "POST") return J(200, Object.keys(files).map((name) => ({ name })).concat([{ name: "../evil.json" }]));
+  if (url.includes("/storage/v1/object/backups/partner-apps/") && m === "GET") { const f = files[url.split("/").pop()]; return f ? J(200, f) : J(400, {}); }
   if (url.includes("/rest/v1/leads") && m === "GET") {
     const q = decodeURIComponent(url);
     return J(200, leads.filter((l) => q.includes(`"${l.data.email}"`) || q.includes(`"${l.data.phone}"`)).map((l) => ({ id: l.id })));
@@ -23,7 +26,7 @@ router._setFetch(async (url, opts = {}) => {
   if (url.includes("/rest/v1/push_subscriptions")) return J(200, url.includes("user_id=eq.u-owner") ? [{ endpoint: "e1", p256dh: "k", auth: "a" }] : []);
   return J(404, {});
 });
-const files = {}; let saveStatus = 200; const pushes = [];
+const files = {}; const FILE = (f) => /^\d{4}-\d{2}-\d{2}-[0-9a-f]{12}\.json$/.test(f); let saveStatus = 200; const pushes = [];
 router._setPush(async (subs, p) => { pushes.push({ subs, p }); return subs.length; });
 let now = Date.UTC(2026, 10, 15, 21, 30);   // 23:30 SAST on 15 Nov
 router._setNow(() => now);
@@ -60,6 +63,7 @@ const good = (o = {}) => ({ name: "  Thandi   Mokoena ", business: "Café <b>Sol
   app.use("/api/rewards/web-lead", cors({ origin: (req, cb) => cb(null, router.origins()), methods: ["POST"] }));
   app.use("/api/rewards/partner-apply", cors({ origin: (req, cb) => cb(null, router.origins()), methods: ["POST"] }));
   app.use(cors({ origin: ["https://hub.test"] }));   // the strictest ALLOWED_ORIGINS the server could have
+  app.use((req, _res, next) => { const u = req.get("x-test-user"); if (u) req.sentivUser = u; next(); });   // stands in for server.js's sign-in gate
   app.use("/api/rewards", router);
   const srv = app.listen(0); const base = `http://127.0.0.1:${srv.address().port}/api/rewards`;
   const post = (body, origin = "https://site.test", ip = "1.1.1.1") => fetch(`${base}/web-lead`, { method: "POST",
@@ -120,13 +124,21 @@ const good = (o = {}) => ({ name: "  Thandi   Mokoena ", business: "Café <b>Sol
   // ---- area partner applications ----
   const { buildPartnerApp } = router;
   const pa = (o = {}) => ({ name: " Sipho  Dlamini ", city: "Durban", experience: "1 to 3 years", car: "yes", email: "Sipho@Mail.test", whatsapp: "082 555 1234",
-    about: "Sold <b>insurance</b>\nfor two years", consent: "on", page: "/area-partners", website: "", business: "rewards", stage: "Won", ...o });
+    about: "Sold <b>insurance</b>\nfor two years", consent: "on", suburb: " Umhlanga ", work: "Part-time job", hours: "10 to 20 hours", laptop: "yes",
+    languages: ["English", "isiZulu", "Klingon"], heard: "LinkedIn", linkedin: "linkedin.com/in/sipho", page: "/area-partners", website: "", business: "rewards", stage: "Won", ...o });
   const A = buildPartnerApp(pa(), now).app;
   check("partner: fields tidied, markup stripped", A.name === "Sipho Dlamini" && A.email === "sipho@mail.test" && A.phone === "082 555 1234" && A.car === true && !/[<>]/.test(JSON.stringify(A)));
   check("partner: never looks like a lead", !("business" in A) && !("stage" in A) && !("website" in A));
   check("partner: consent recorded", A.consent.includes("/area-partners"));
   for (const [n, o] of [["no name", { name: "" }], ["other city", { city: "Cape Town" }], ["unknown experience", { experience: "lots" }], ["no transport answer", { car: "" }],
     ["bad email", { email: "x" }], ["bad phone", { whatsapp: "12" }], ["no consent", { consent: "" }]]) check(`partner refused: ${n}`, !!buildPartnerApp(pa(o), now).error);
+  check("partner: new fields kept", A.suburb === "Umhlanga" && A.work === "Part-time job" && A.hours === "10 to 20 hours" && A.laptop === true && A.heard === "LinkedIn" && A.status === "New");
+  check("partner: only known languages", JSON.stringify(A.languages) === '["English","isiZulu"]', JSON.stringify(A.languages));
+  check("partner: LinkedIn link gets https", A.linkedin === "https://linkedin.com/in/sipho", A.linkedin);
+  check("partner: languages as a comma string work", buildPartnerApp(pa({ languages: "Afrikaans,English" }), now).app.languages.length === 2);
+  for (const [n, o] of [["no suburb", { suburb: "" }], ["unknown work", { work: "astronaut" }], ["unknown hours", { hours: "all" }], ["no laptop answer", { laptop: "" }],
+    ["no language", { languages: [] }], ["unknown heard", { heard: "TV" }], ["not a LinkedIn link", { linkedin: "https://evil.test/x" }]]) check(`partner refused: ${n}`, !!buildPartnerApp(pa(o), now).error);
+  check("partner: LinkedIn is optional", !buildPartnerApp(pa({ linkedin: "" }), now).error);
   check("partner: 'no' transport is kept as false", buildPartnerApp(pa({ car: "no" }), now).app.car === false);
 
   router._resetLimits(); leads = [];
@@ -151,6 +163,29 @@ const good = (o = {}) => ({ name: "  Thandi   Mokoena ", business: "Café <b>Sol
   r = await ppost(pa({ whatsapp: "0835551236" }));
   check("partner: a storage failure tells the visitor", r.status === 502 && /WhatsApp/.test((await r.json()).error) && pushes.length === 1);
   saveStatus = 200;
+  check("partner: push names suburb and hours", pushes[0].p.body.includes("Umhlanga") && pushes[0].p.body.includes("10 to 20 hours"), pushes[0].p.body);
+
+  // the owner's Applicants list
+  const owner = (path, opts = {}, user = "u-owner") => fetch(`${base}${path}`, { ...opts, headers: { "Content-Type": "application/json", ...(user ? { "x-test-user": user } : {}) } });
+  r = await owner("/partner-apps", {}, "");
+  check("list: not signed in → 401", r.status === 401);
+  r = await owner("/partner-apps", {}, "u-agent");
+  check("list: an agent is refused", r.status === 403);
+  r = await owner("/partner-apps");
+  let lj = await r.json();
+  check("list: owner sees the application, junk names skipped", r.status === 200 && lj.apps.length === 1 && lj.apps[0].name === "Sipho Dlamini" && FILE(lj.apps[0].file), JSON.stringify(lj).slice(0, 200));
+  const file = lj.apps[0].file;
+  r = await owner("/partner-apps/status", { method: "POST", body: JSON.stringify({ file, status: "Interview", note: "Good <b>call</b>" }) });
+  let sj = await r.json();
+  check("status: saved on the file", r.status === 200 && sj.app.status === "Interview" && files[file].status === "Interview" && files[file].note === "Good b call /b");
+  r = await owner("/partner-apps/status", { method: "POST", body: JSON.stringify({ file, status: "Hired!!" }) });
+  check("status: unknown status refused", r.status === 400 && files[file].status === "Interview");
+  r = await owner("/partner-apps/status", { method: "POST", body: JSON.stringify({ file: "../../leads.json", status: "New" }) });
+  check("status: a strange file name is refused", r.status === 400);
+  r = await owner("/partner-apps/status", { method: "POST", body: JSON.stringify({ file, status: "Declined" }) }, "u-agent");
+  check("status: an agent cannot change it", r.status === 403 && files[file].status === "Interview");
+  r = await owner("/partner-apps/status", { method: "POST", body: JSON.stringify({ file, status: "Onboarded", invitedAt: 123 }) });
+  check("status: invited time kept", r.status === 200 && files[file].invitedAt === 123 && files[file].status === "Onboarded");
 
   let h = await (await fetch(`${base}/health`)).json();
   check("health says open, shows no secrets", h.webLead.open === true && h.webLead.origins === 2 && !JSON.stringify(h).includes("SVC") && !JSON.stringify(h).includes("site.test"));

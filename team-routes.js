@@ -85,7 +85,7 @@ router.post("/invite", async (req, res) => {
       }
     }
     console.log(`[team] ${type} link made by ${me.id.slice(0, 8)} for ${email.replace(/^(.).*@/, "$1***@")}`);
-    res.json({ ok: true, type, existing: type === "recovery", email, link: `${APP_URL()}/?join=${encodeURIComponent(g.hashed)}&jt=${type}` });
+    res.json({ ok: true, type, existing: type === "recovery", email, userId: g.userId || null, link: `${APP_URL()}/?join=${encodeURIComponent(g.hashed)}&jt=${type}` });
   } catch (e) { res.status(502).json({ error: `Invite failed: ${e.message}` }); }
 });
 

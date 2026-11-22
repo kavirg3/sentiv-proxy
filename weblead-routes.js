@@ -160,19 +160,37 @@ router.post("/web-lead", async (req, res) => {
 const crypto = require("crypto");
 const PARTNER_CITIES = ["Johannesburg", "Durban"];
 const PARTNER_EXPERIENCE = ["No sales experience yet", "Less than 1 year", "1 to 3 years", "More than 3 years"];
+const PARTNER_WORK = ["Full-time job", "Part-time job", "Self-employed", "Not working right now"];
+const PARTNER_HOURS = ["Under 10 hours", "10 to 20 hours", "More than 20 hours"];
+const PARTNER_LANGS = ["English", "isiZulu", "Afrikaans", "Sesotho", "isiXhosa", "Setswana", "Sepedi", "Other"];
+const PARTNER_HEARD = ["LinkedIn", "Pnet", "WhatsApp", "A friend", "Other"];
+const PARTNER_STATUSES = ["New", "Chatted", "Interview", "Onboarded", "Declined"];
+const yesNo = (v) => (v === "yes" || v === true ? true : v === "no" || v === false ? false : null);
 const APP_DIR = "backups/partner-apps";
 
 function buildPartnerApp(body, now) {
   const b = body && typeof body === "object" && !Array.isArray(body) ? body : {};
   const name = clean(b.name, 80), city = clean(b.city, 40), experience = clean(b.experience, 40);
   const email = clean(b.email, 120).toLowerCase(), phone = saPhone(b.whatsapp);
-  const car = b.car === "yes" ? true : b.car === "no" ? false : null;
-  const about = clean(b.about, 800);
+  const car = yesNo(b.car), laptop = yesNo(b.laptop);
+  const about = clean(b.about, 800), suburb = clean(b.suburb, 60);
+  const work = clean(b.work, 40), hours = clean(b.hours, 40), heard = clean(b.heard, 40);
+  const langIn = Array.isArray(b.languages) ? b.languages : String(b.languages || "").split(",");
+  const languages = PARTNER_LANGS.filter((l) => langIn.map((x) => clean(x, 20)).includes(l));
+  let linkedin = clean(b.linkedin, 200);
+  if (linkedin && !/^https?:\/\//i.test(linkedin)) linkedin = `https://${linkedin}`;
   const page = (clean(b.page, 80).match(/^\/[a-z0-9\-./]*$/i) || [""])[0];
   if (name.length < 2) return { error: "Please enter your name." };
   if (!PARTNER_CITIES.includes(city)) return { error: "Please choose your city." };
   if (!PARTNER_EXPERIENCE.includes(experience)) return { error: "Please choose your sales experience." };
+  if (suburb.length < 2) return { error: "Please enter the suburb you live in." };
+  if (!PARTNER_WORK.includes(work)) return { error: "Please choose what you do now." };
+  if (!PARTNER_HOURS.includes(hours)) return { error: "Please choose how many hours a week you have." };
   if (car === null) return { error: "Please tell us if you have your own transport." };
+  if (laptop === null) return { error: "Please tell us if you have your own laptop." };
+  if (!languages.length) return { error: "Please tick at least one language." };
+  if (!PARTNER_HEARD.includes(heard)) return { error: "Please tell us where you heard about us." };
+  if (linkedin && !/^https:\/\/([a-z]{2,3}\.)?linkedin\.com\/[^\s]*$/i.test(linkedin)) return { error: "Please enter a LinkedIn profile link, or leave it empty." };
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return { error: "Please enter a valid email address." };
   if (!phone) return { error: "Please enter a valid South African WhatsApp number." };
   if (!(b.consent === true || b.consent === "on" || b.consent === "true")) return { error: "Please tick the consent box." };
@@ -180,7 +198,8 @@ function buildPartnerApp(body, now) {
   const key = crypto.createHash("sha256").update(phone).digest("hex").slice(0, 12);
   return { app: {
     id: `PA${now.toString(36)}`, file: `${day}-${key}.json`,   // same number, same day → same file (no duplicates)
-    name, city, experience, car, email, phone, about, at: now, day, page,
+    name, city, suburb, experience, work, hours, car, laptop, languages, heard, linkedin, email, phone, about, at: now, day, page,
+    status: "New", note: "",
     consent: `Website form${page ? ` (${page})` : ""}, ${dmy(day)} — ticked the POPIA consent box`,
   } };
 }
@@ -210,7 +229,7 @@ async function tellOwner(owner, a) {
     const hub = env("PUSH_APP_URL").replace(/\/+$/, "") || "https://sentiv-sales-hub.pages.dev";
     return await _push(subs, {
       title: `New area partner: ${a.name} · ${a.city}`,
-      body: `${a.experience} · ${a.car ? "own transport" : "no transport"} · ${a.phone}`,
+      body: `${a.suburb} · ${a.experience} · ${a.hours} · ${a.phone}`,
       tag: `partner-${a.file}`, url: `${hub}/`,
     });
   } catch (e) { console.warn("partner-apply push error", e.message); return 0; }
@@ -246,5 +265,58 @@ router.post("/partner-apply", async (req, res) => {
   }
 });
 
+// ---- The owner's Applicants list in the Hub (signed in; owner only) ----
+//   GET  /api/rewards/partner-apps            every application, newest first
+//   POST /api/rewards/partner-apps/status     { file, status?, note?, invitedAt? } → saved on the file
+async function ownerOnly(req, res) {
+  const uid = req.sentivUser;
+  if (!uid) { res.status(401).json({ error: "Sign in again." }); return false; }
+  const r = await _fetch(`${SB_URL()}/rest/v1/profiles?id=eq.${encodeURIComponent(uid)}&select=role`, { headers: svc() });
+  const rows = r.ok ? await r.json() : [];
+  if (!(rows[0] && rows[0].role === "owner")) { res.status(403).json({ error: "Only the owner can see applications." }); return false; }
+  return true;
+}
+const FILE_RE = /^\d{4}-\d{2}-\d{2}-[0-9a-f]{12}\.json$/;
+async function readApp(file) {
+  const r = await _fetch(`${SB_URL()}/storage/v1/object/${APP_DIR}/${file}`, { headers: svc() });
+  if (!r.ok) return null;
+  try { return JSON.parse(await r.text()); } catch (e) { return null; }
+}
+router.get("/partner-apps", async (req, res) => {
+  try {
+    if (!SB_URL() || !SB_SERVICE()) return res.status(503).json({ error: "Not set up." });
+    if (!(await ownerOnly(req, res))) return;
+    const l = await _fetch(`${SB_URL()}/storage/v1/object/list/backups`, { method: "POST", headers: svc(),
+      body: JSON.stringify({ prefix: "partner-apps/", limit: 1000, offset: 0, sortBy: { column: "name", order: "desc" } }) });
+    if (!l.ok) return res.status(502).json({ error: `Could not list applications (${l.status}).` });
+    const names = ((await l.json()) || []).map((o) => o && o.name).filter((n) => FILE_RE.test(String(n || "")));
+    const apps = [];
+    for (let i = 0; i < names.length; i += 10) {
+      const got = await Promise.all(names.slice(i, i + 10).map(async (n) => { const a = await readApp(n); return a ? { status: "New", note: "", ...a, file: n } : null; }));
+      apps.push(...got.filter(Boolean));
+    }
+    apps.sort((a, b) => (b.at || 0) - (a.at || 0));
+    res.json({ ok: true, apps, statuses: PARTNER_STATUSES });
+  } catch (e) { console.error("partner-apps list error", e.message); res.status(502).json({ error: "Could not load applications." }); }
+});
+router.post("/partner-apps/status", async (req, res) => {
+  try {
+    if (!SB_URL() || !SB_SERVICE()) return res.status(503).json({ error: "Not set up." });
+    if (!(await ownerOnly(req, res))) return;
+    const b = req.body || {};
+    const file = String(b.file || "");
+    if (!FILE_RE.test(file)) return res.status(400).json({ error: "Unknown application." });
+    const a = await readApp(file);
+    if (!a) return res.status(404).json({ error: "That application is gone." });
+    if (b.status != null) { if (!PARTNER_STATUSES.includes(b.status)) return res.status(400).json({ error: "Unknown status." }); a.status = b.status; }
+    if (b.note != null) a.note = clean(b.note, 600);
+    if (b.invitedAt != null) a.invitedAt = Number(b.invitedAt) || _now();
+    a.updatedAt = _now();
+    const w = await _fetch(`${SB_URL()}/storage/v1/object/${APP_DIR}/${file}`, { method: "POST", headers: svc({ "x-upsert": "true" }), body: JSON.stringify({ ...a, file: undefined }) });
+    if (!w.ok) return res.status(502).json({ error: `Could not save (${w.status}).` });
+    res.json({ ok: true, app: { ...a, file } });
+  } catch (e) { console.error("partner-apps status error", e.message); res.status(502).json({ error: "Could not save." }); }
+});
+
 module.exports = router;
-Object.assign(module.exports, { buildWebLead, buildPartnerApp, saPhone, origins, TYPES, PARTNER_CITIES, PARTNER_EXPERIENCE });
+Object.assign(module.exports, { buildWebLead, buildPartnerApp, saPhone, origins, TYPES, PARTNER_CITIES, PARTNER_EXPERIENCE, PARTNER_WORK, PARTNER_HOURS, PARTNER_LANGS, PARTNER_HEARD, PARTNER_STATUSES });
