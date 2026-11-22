@@ -18,8 +18,13 @@ router._setFetch(async (url, opts = {}) => {
     return J(200, leads.filter((l) => q.includes(`"${l.data.email}"`) || q.includes(`"${l.data.phone}"`)).map((l) => ({ id: l.id })));
   }
   if (url.endsWith("/rest/v1/leads") && m === "POST") { if (insertStatus >= 300) return J(insertStatus, { message: "no" }); leads.push(JSON.parse(opts.body)); return J(201, {}); }
+  if (url.includes("/storage/v1/object/info/")) return files[url.split("/").pop()] ? J(200, {}) : J(400, { error: "not found" });
+  if (url.includes("/storage/v1/object/backups/partner-apps/") && m === "POST") { if (saveStatus >= 300) return J(saveStatus, {}); files[url.split("/").pop()] = JSON.parse(opts.body); return J(200, {}); }
+  if (url.includes("/rest/v1/push_subscriptions")) return J(200, url.includes("user_id=eq.u-owner") ? [{ endpoint: "e1", p256dh: "k", auth: "a" }] : []);
   return J(404, {});
 });
+const files = {}; let saveStatus = 200; const pushes = [];
+router._setPush(async (subs, p) => { pushes.push({ subs, p }); return subs.length; });
 let now = Date.UTC(2026, 10, 15, 21, 30);   // 23:30 SAST on 15 Nov
 router._setNow(() => now);
 
@@ -53,6 +58,7 @@ const good = (o = {}) => ({ name: "  Thandi   Mokoena ", business: "Café <b>Sol
   const app = express();
   app.use(express.json({ limit: "2mb", verify: (req, _res, buf) => { req.rawBody = buf; } }));
   app.use("/api/rewards/web-lead", cors({ origin: (req, cb) => cb(null, router.origins()), methods: ["POST"] }));
+  app.use("/api/rewards/partner-apply", cors({ origin: (req, cb) => cb(null, router.origins()), methods: ["POST"] }));
   app.use(cors({ origin: ["https://hub.test"] }));   // the strictest ALLOWED_ORIGINS the server could have
   app.use("/api/rewards", router);
   const srv = app.listen(0); const base = `http://127.0.0.1:${srv.address().port}/api/rewards`;
@@ -110,6 +116,41 @@ const good = (o = {}) => ({ name: "  Thandi   Mokoena ", business: "Café <b>Sol
   ownerRows = [{ id: "u-owner" }];
   r = await post("{not json", "https://site.test", "5.5.5.7");
   check("broken JSON is refused", r.status === 400, `HTTP ${r.status}`);
+
+  // ---- area partner applications ----
+  const { buildPartnerApp } = router;
+  const pa = (o = {}) => ({ name: " Sipho  Dlamini ", city: "Durban", experience: "1 to 3 years", car: "yes", email: "Sipho@Mail.test", whatsapp: "082 555 1234",
+    about: "Sold <b>insurance</b>\nfor two years", consent: "on", page: "/area-partners", website: "", business: "rewards", stage: "Won", ...o });
+  const A = buildPartnerApp(pa(), now).app;
+  check("partner: fields tidied, markup stripped", A.name === "Sipho Dlamini" && A.email === "sipho@mail.test" && A.phone === "082 555 1234" && A.car === true && !/[<>]/.test(JSON.stringify(A)));
+  check("partner: never looks like a lead", !("business" in A) && !("stage" in A) && !("website" in A));
+  check("partner: consent recorded", A.consent.includes("/area-partners"));
+  for (const [n, o] of [["no name", { name: "" }], ["other city", { city: "Cape Town" }], ["unknown experience", { experience: "lots" }], ["no transport answer", { car: "" }],
+    ["bad email", { email: "x" }], ["bad phone", { whatsapp: "12" }], ["no consent", { consent: "" }]]) check(`partner refused: ${n}`, !!buildPartnerApp(pa(o), now).error);
+  check("partner: 'no' transport is kept as false", buildPartnerApp(pa({ car: "no" }), now).app.car === false);
+
+  router._resetLimits(); leads = [];
+  const ppost = (body, origin = "https://site.test", ip = "7.7.7.7") => fetch(`${base}/partner-apply`, { method: "POST",
+    headers: { "Content-Type": "application/json", ...(origin ? { Origin: origin } : {}), "x-forwarded-for": ip }, body: JSON.stringify(body) });
+  const ppre = await fetch(`${base}/partner-apply`, { method: "OPTIONS", headers: { Origin: "https://site.test", "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "content-type" } });
+  check("partner: browser pre-check passes for the website", ppre.headers.get("access-control-allow-origin") === "https://site.test");
+  r = await ppost(pa());
+  check("partner: application accepted", r.status === 200 && (await r.json()).ok === true, `HTTP ${r.status}`);
+  const saved = Object.values(files);
+  check("partner: saved as one file, NOT as a lead", saved.length === 1 && leads.length === 0 && saved[0].city === "Durban");
+  check("partner: owner gets one push with name, city and number", pushes.length === 1 && /Sipho Dlamini · Durban/.test(pushes[0].p.title) && pushes[0].p.body.includes("082 555 1234"));
+  r = await ppost(pa({ email: "again@mail.test" }));
+  check("partner: same number same day = one file, one push", r.status === 200 && Object.keys(files).length === 1 && pushes.length === 1);
+  r = await ppost(pa({ whatsapp: "0835551235" }), "https://evil.test");
+  check("partner: another website is refused", r.status === 403 && Object.keys(files).length === 1);
+  r = await ppost(pa({ whatsapp: "0835551235", website: "spam" }));
+  check("partner: honeypot saves nothing", r.status === 200 && Object.keys(files).length === 1);
+  r = await ppost(pa({ whatsapp: "0835551235", city: "Pretoria" }));
+  check("partner: bad city gets a plain message", r.status === 400 && /city/.test((await r.json()).error));
+  saveStatus = 500;
+  r = await ppost(pa({ whatsapp: "0835551236" }));
+  check("partner: a storage failure tells the visitor", r.status === 502 && /WhatsApp/.test((await r.json()).error) && pushes.length === 1);
+  saveStatus = 200;
 
   let h = await (await fetch(`${base}/health`)).json();
   check("health says open, shows no secrets", h.webLead.open === true && h.webLead.origins === 2 && !JSON.stringify(h).includes("SVC") && !JSON.stringify(h).includes("site.test"));

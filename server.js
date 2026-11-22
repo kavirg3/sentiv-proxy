@@ -15,6 +15,7 @@ app.use(express.json({ limit: "2mb", verify: (req, _res, buf) => { req.rawBody =
 // The Digital Rewards website posts its lead form from its own address, so this one path
 // answers that site's browser check (WEBLEAD_ORIGINS) whatever ALLOWED_ORIGINS says.
 app.use("/api/rewards/web-lead", cors({ origin: (req, cb) => cb(null, require("./weblead-routes").origins()), methods: ["POST"] }));
+app.use("/api/rewards/partner-apply", cors({ origin: (req, cb) => cb(null, require("./weblead-routes").origins()), methods: ["POST"] }));
 app.use(cors({ origin: (process.env.ALLOWED_ORIGINS || "*").split(",") }));
 
 const need = (res, pairs) => {
@@ -67,6 +68,7 @@ const PUBLIC_ROUTES = [
   ["GET", /^\/api\/payfast\/i\/[^/]+\/[^/]+\/[0-9a-f]{16,64}$/],   // the client's invoice page — opened by its secret key
   ["POST", /^\/api\/payfast\/itn$/],        // PayFast's payment notice: signature + PayFast's own confirmation
   ["GET", /^\/api\/rewards\/health$/],
+  ["POST", /^\/api\/rewards\/partner-apply$/],   // the website's Area Partner form: same origin list + honeypot + limits
   ["POST", /^\/api\/rewards\/web-lead$/],   // the Digital Rewards website form: origin list + honeypot + limits (weblead-routes.js)
   ["GET", /^\/api\/euphoria\/archive\/health$/],
   ["POST", /^\/api\/euphoria\/archive\/sweep$/],  // x-archive-secret (daily GitHub Action)

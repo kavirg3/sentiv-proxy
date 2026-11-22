@@ -149,5 +149,102 @@ router.post("/web-lead", async (req, res) => {
   }
 });
 
+// ---- Area partner applications (22 Nov 2026) ----
+//
+//   POST /api/rewards/partner-apply   public — the website's /area-partners form
+//
+// People applying to be an Area Partner (they run meetings and look after clients). These are
+// NOT sales leads, so they never go in the leads table (that would put them in Thembi's list).
+// Each one is saved as a JSON file in the private "backups" bucket under partner-apps/ and the
+// owner gets a push with the name, city and number. Same origin list, honeypot and limits as web-lead.
+const crypto = require("crypto");
+const PARTNER_CITIES = ["Johannesburg", "Durban"];
+const PARTNER_EXPERIENCE = ["No sales experience yet", "Less than 1 year", "1 to 3 years", "More than 3 years"];
+const APP_DIR = "backups/partner-apps";
+
+function buildPartnerApp(body, now) {
+  const b = body && typeof body === "object" && !Array.isArray(body) ? body : {};
+  const name = clean(b.name, 80), city = clean(b.city, 40), experience = clean(b.experience, 40);
+  const email = clean(b.email, 120).toLowerCase(), phone = saPhone(b.whatsapp);
+  const car = b.car === "yes" ? true : b.car === "no" ? false : null;
+  const about = clean(b.about, 800);
+  const page = (clean(b.page, 80).match(/^\/[a-z0-9\-./]*$/i) || [""])[0];
+  if (name.length < 2) return { error: "Please enter your name." };
+  if (!PARTNER_CITIES.includes(city)) return { error: "Please choose your city." };
+  if (!PARTNER_EXPERIENCE.includes(experience)) return { error: "Please choose your sales experience." };
+  if (car === null) return { error: "Please tell us if you have your own transport." };
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return { error: "Please enter a valid email address." };
+  if (!phone) return { error: "Please enter a valid South African WhatsApp number." };
+  if (!(b.consent === true || b.consent === "on" || b.consent === "true")) return { error: "Please tick the consent box." };
+  const day = sastDay(now);
+  const key = crypto.createHash("sha256").update(phone).digest("hex").slice(0, 12);
+  return { app: {
+    id: `PA${now.toString(36)}`, file: `${day}-${key}.json`,   // same number, same day → same file (no duplicates)
+    name, city, experience, car, email, phone, about, at: now, day, page,
+    consent: `Website form${page ? ` (${page})` : ""}, ${dmy(day)} — ticked the POPIA consent box`,
+  } };
+}
+
+// Push to the owner. Swappable for tests; quietly does nothing if push is not set up.
+let _push = async (subs, payload) => {
+  const pub = env("VAPID_PUBLIC_KEY"), priv = env("VAPID_PRIVATE_KEY"), subj = env("VAPID_SUBJECT");
+  if (!pub || !priv || !subj) return 0;
+  const webpush = require("web-push");
+  let sent = 0;
+  for (const s of subs) {
+    try {
+      await webpush.sendNotification({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, JSON.stringify(payload),
+        { TTL: 3600 * 24, urgency: "normal", vapidDetails: { subject: subj, publicKey: pub, privateKey: priv } });
+      sent++;
+    } catch (e) { console.warn("partner-apply push failed", (e && e.statusCode) || "", (e && e.message) || e); }
+  }
+  return sent;
+};
+router._setPush = (f) => { _push = f; };   // tests
+
+async function tellOwner(owner, a) {
+  try {
+    const r = await _fetch(`${SB_URL()}/rest/v1/push_subscriptions?select=endpoint,p256dh,auth&user_id=eq.${owner}`, { headers: svc() });
+    const subs = r.ok ? await r.json() : [];
+    if (!Array.isArray(subs) || !subs.length) return 0;
+    const hub = env("PUSH_APP_URL").replace(/\/+$/, "") || "https://sentiv-sales-hub.pages.dev";
+    return await _push(subs, {
+      title: `New area partner: ${a.name} · ${a.city}`,
+      body: `${a.experience} · ${a.car ? "own transport" : "no transport"} · ${a.phone}`,
+      tag: `partner-${a.file}`, url: `${hub}/`,
+    });
+  } catch (e) { console.warn("partner-apply push error", e.message); return 0; }
+}
+
+router.post("/partner-apply", async (req, res) => {
+  try {
+    const allow = origins();
+    if (!allow.length || !SB_URL() || !SB_SERVICE()) return res.status(503).json({ error: "The form is not switched on yet." });
+    const origin = String(req.get("origin") || "").replace(/\/+$/, "");
+    if (!allow.includes(origin)) return res.status(403).json({ error: "Not allowed from this website." });
+    if (req.rawBody && req.rawBody.length > 8192) return res.status(413).json({ error: "That message is too long." });
+    const body = req.body || {};
+    if (clean(body.website, 200)) return res.json({ ok: true });   // honeypot
+    const now = _now();
+    const built = buildPartnerApp(body, now);
+    if (built.error) return res.status(400).json({ error: built.error });
+    const why = limited(clientIp(req), now);
+    if (why) return res.status(429).json({ error: why });
+    const a = built.app;
+    const url = `${SB_URL()}/storage/v1/object/${APP_DIR}/${a.file}`;
+    const seen = await _fetch(`${SB_URL()}/storage/v1/object/info/${APP_DIR}/${a.file}`, { headers: svc() });
+    if (seen.ok) return res.json({ ok: true });   // already applied today
+    const r = await _fetch(url, { method: "POST", headers: svc({ "x-upsert": "true" }), body: JSON.stringify(a) });
+    if (!r.ok) { console.error("partner-apply save failed", r.status, (await r.text()).slice(0, 200)); return res.status(502).json({ error: "Could not send your application. Please WhatsApp us." }); }
+    const owner = await ownerId(now);
+    const pushed = owner ? await tellOwner(owner, a) : 0;
+    console.log("partner-apply saved", JSON.stringify({ file: a.file, city: a.city, pushed }));
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("partner-apply error", e.message);
+    res.status(502).json({ error: "Could not send your application. Please WhatsApp us." });
+  }
+});
+
 module.exports = router;
-Object.assign(module.exports, { buildWebLead, saPhone, origins, TYPES });
+Object.assign(module.exports, { buildWebLead, buildPartnerApp, saPhone, origins, TYPES, PARTNER_CITIES, PARTNER_EXPERIENCE });

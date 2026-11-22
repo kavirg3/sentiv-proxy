@@ -114,6 +114,9 @@ async function proxy() {
   check("Website form", "another website cannot post a lead", wlRefused(wl1), `HTTP ${wl1.status}`);
   const wl2 = await wlPost("");
   check("Website form", "a script with no website cannot post a lead", wlRefused(wl2), `HTTP ${wl2.status}`);
+  const paPost = await get(`${PROXY}/api/rewards/partner-apply`, { method: "POST", headers: { "Content-Type": "application/json", Origin: "https://not-our-website.example" },
+    body: JSON.stringify({ name: "Health Check", city: "Durban", experience: "1 to 3 years", car: "yes", email: "health@example.com", whatsapp: "0820000000", consent: "on" }) });
+  check("Website form", "another website cannot send a partner application", wlRefused(paPost), `HTTP ${paPost.status}`);
 
   const ku = await get(`${PROXY}/api/kuration/health`);
   check("Lead research", "Kuration route is up", ku.status === 200, `HTTP ${ku.status}`);
