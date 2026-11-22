@@ -604,11 +604,14 @@ async function pcloudBytes(fileid) {
 }
 
 // The archive root, and whether it is safely outside the Vault. Cached for 10 minutes.
-let _arch = { at: 0, root: "", fenced: false, why: "" };
-async function archiveRoot() {
-  if (_arch.root && Date.now() - _arch.at < 600e3) return _arch;
-  if (!PC_TOKEN()) return (_arch = { at: Date.now(), root: "", fenced: false, why: "PCLOUD_TOKEN not set" });
-  const root = await pcloudFolder({ path: ARCHIVE_PATH() });
+// One cache per folder: call recordings and (since 22 Nov 2026) meeting recordings.
+const _archs = new Map();
+async function archiveRoot(where = ARCHIVE_PATH()) {
+  const hit = _archs.get(where);
+  if (hit && hit.root && Date.now() - hit.at < 600e3) return hit;
+  let _arch;
+  if (!PC_TOKEN()) { _arch = { at: Date.now(), root: "", fenced: false, why: "PCLOUD_TOKEN not set" }; _archs.set(where, _arch); return _arch; }
+  const root = await pcloudFolder({ path: where });
   let fenced = true, why = "";
   if (PC_ROOT() === "0") { fenced = false; why = "PCLOUD_ROOT is not set, so the Vault shows the whole drive — recordings would be visible to every agent"; }
   else {
@@ -622,12 +625,13 @@ async function archiveRoot() {
     }
   }
   _arch = { at: Date.now(), root, fenced, why };
+  _archs.set(where, _arch);
   return _arch;
 }
-async function archiveReady() {
-  const a = await archiveRoot();
-  if (!a.root) throw Object.assign(new Error(`Call archive isn't set up: ${a.why}`), { status: 501 });
-  if (!a.fenced) throw Object.assign(new Error(`Call archive is switched off: ${a.why}`), { status: 503 });
+async function archiveReady(where = ARCHIVE_PATH(), label = "Call archive") {
+  const a = await archiveRoot(where);
+  if (!a.root) throw Object.assign(new Error(`${label} isn't set up: ${a.why}`), { status: 501 });
+  if (!a.fenced) throw Object.assign(new Error(`${label} is switched off: ${a.why}`), { status: 503 });
   return a;
 }
 
@@ -701,12 +705,12 @@ async function archiveCalls(calls, cap) {
 
 // Who may play an archived file: walk file → month folder → agent folder → archive root.
 // Anything not exactly in that shape (a Vault file, a personal file) is refused.
-async function archiveOwnerOf(fileid) {
+async function archiveOwnerOf(fileid, where = ARCHIVE_PATH(), nameRe = ARCHIVE_NAME_RE) {
   if (!/^\d{1,20}$/.test(String(fileid))) return null;
-  const a = await archiveReady();
+  const a = await archiveReady(where);
   const f = await pcloud("checksumfile", { fileid }).catch(() => null);
   const meta = f && f.metadata;
-  if (!meta || meta.isfolder || !ARCHIVE_NAME_RE.test(String(meta.name))) return null;
+  if (!meta || meta.isfolder || !nameRe.test(String(meta.name))) return null;
   const month = await pcloud("listfolder", { folderid: meta.parentfolderid, nofiles: 1 }).catch(() => null);
   const mm = month && month.metadata;
   if (!mm || !/^\d{4}-\d{2}$/.test(String(mm.name))) return null;
@@ -817,7 +821,7 @@ router.get("/archive/list", async (req, res) => {
 });
 
 // Recordings older than 12 months go. Whole month folders first, then the edge month by file.
-async function pruneArchive(rootId, now = Date.now()) {
+async function pruneArchive(rootId, now = Date.now(), nameRe = ARCHIVE_NAME_RE) {
   const cutoff = new Date(now - ARCHIVE_KEEP_DAYS * 864e5).toISOString().slice(0, 10);
   const cutMonth = cutoff.slice(0, 7);
   let files = 0, folders = 0;
@@ -829,7 +833,7 @@ async function pruneArchive(rootId, now = Date.now()) {
       if (m.name > cutMonth) continue;
       const list = await pcloud("listfolder", { folderid: m.folderid });
       for (const f of (list.metadata.contents || [])) {
-        const mm = !f.isfolder && String(f.name).match(ARCHIVE_NAME_RE);
+        const mm = !f.isfolder && String(f.name).match(nameRe);
         if (mm && mm[1] < cutoff) { await pcloud("deletefile", { fileid: f.fileid }); files++; }
       }
     }
@@ -914,6 +918,8 @@ router.post("/archive/sweep", async (req, res) => {
       Object.assign(out, { recorded: calls.length, archived: Object.keys(r.files).length, uploaded: r.uploaded, pending: r.pending, errors: r.errors });
     } else out.skipped = "Euphoria or Supabase not configured";
     out.prune = await pruneArchive(a.root);
+    // Meeting recordings (22 Nov 2026) follow the same 12-month rule.
+    out.meetPrune = await archiveReady(MEET_PATH(), "Meeting archive").then((m) => pruneArchive(m.root, Date.now(), MEET_NAME_RE)).catch((e) => ({ error: e.message }));
     out.stats = await archiveStats(a.root).catch((e) => ({ error: e.message }));
     out.ok = out.selftest === true;   // a call Euphoria won't hand over is reported, not fatal
     console.log(`[archive] sweep ${JSON.stringify(out)}`);
@@ -921,12 +927,149 @@ router.post("/archive/sweep", async (req, res) => {
   } catch (e) { out.error = e.message; res.status(e.status || 502).json(out); }
 });
 
+// =====================================================================================
+// MEETING RECORDINGS (22 Nov 2026, Hub v339)
+//
+// The Hub's meeting recorder now keeps the audio as well as the text. The phone records
+// while it transcribes; on Stop it sends the audio here, and it is kept in pCloud beside
+// the call recordings, under the same rules:
+//
+//     /Sentiv Meeting Recordings/<user id>/<YYYY-MM>/<YYYY-MM-DD>_<Hub meeting id>.mp3
+//
+// Outside the Vault (refuses otherwise), only the person who recorded it or the owner can
+// play it, and the daily sweep deletes anything over 12 months old.
+//
+// POST /api/euphoria/meetings/upload?rec=M<ms>&at=<ms>&transcribe=1   signed in. Body = the
+//      raw audio (webm / mp4 / ogg / wav). Same meeting id twice → the first file is kept
+//      (a retry after a dropped connection must not make a second copy).
+//      → { fileid, seconds, job?, stt }   job = AssemblyAI id, polled at /transcribe/job/:job
+// GET  /api/euphoria/meetings/play/:fileid      signed in, recorder or owner. The audio.
+// POST /api/euphoria/meetings/transcribe/:fileid  signed in, recorder or owner. → { job }
+//
+// Env: MEETINGS_ARCHIVE_PATH (optional, default "/Sentiv Meeting Recordings"), plus the
+//      pCloud and AssemblyAI settings above. Transcription is optional: without
+//      ASSEMBLYAI_API_KEY the audio is still kept.
+// =====================================================================================
+const MEET_PATH = () => clean(process.env.MEETINGS_ARCHIVE_PATH) || "/Sentiv Meeting Recordings";
+const MEET_NAME_RE = /^(\d{4}-\d{2}-\d{2})_(M\d{6,16})\.(mp3|webm|m4a|ogg|wav)$/;
+const MEET_ID_RE = /^M\d{6,16}$/;
+const MEET_MAX_MB = 120;          // ~2.5 h of phone audio before conversion
+const MEET_TYPES = { mp3: "audio/mpeg", webm: "audio/webm", m4a: "audio/mp4", ogg: "audio/ogg", wav: "audio/wav" };
+const extFor = (ct) => /mp4|m4a|aac/i.test(ct) ? "m4a" : /ogg/i.test(ct) ? "ogg" : /wav/i.test(ct) ? "wav" : /mpeg|mp3/i.test(ct) ? "mp3" : "webm";
+
+// Phone audio (Safari's mp4 especially) needs a seekable file, not a pipe, so this goes
+// through a temp file. Mono 48 kbps MP3, the same as the call archive.
+function fileToMp3(buf, ext) {
+  return new Promise((resolve) => {
+    const fs = require("fs"), os = require("os"), path = require("path");
+    let bin = "ffmpeg";
+    try { const p = require("ffmpeg-static"); if (p && fs.existsSync(p)) bin = p; } catch (e) { /* PATH */ }
+    const src = path.join(os.tmpdir(), `meet-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`);
+    try { fs.writeFileSync(src, buf); } catch (e) { return resolve(null); }
+    const done = (v) => { try { fs.unlinkSync(src); } catch (e) { /* gone */ } resolve(v); };
+    const { spawn } = require("child_process");
+    const p = spawn(bin, ["-hide_banner", "-loglevel", "error", "-i", src, "-vn", "-ac", "1", "-b:a", "48k", "-f", "mp3", "pipe:1"]);
+    const chunks = [];
+    p.stdout.on("data", (c) => chunks.push(c));
+    p.on("error", () => done(null));
+    p.on("close", (code) => done(code === 0 && chunks.length ? Buffer.concat(chunks) : null));
+  });
+}
+async function meetTranscribe(uid, audio) {
+  if (!AAI_KEY()) return null;
+  const now = Date.now();
+  const hits = (_sttHits.get(uid) || []).filter((t) => now - t < 864e5);
+  if (hits.length >= STT_PER_DAY) throw Object.assign(new Error("Daily transcription limit reached."), { status: 429 });
+  const up = await fetch(`${AAI_BASE()}/v2/upload`, { method: "POST", headers: { authorization: AAI_KEY(), "content-type": "application/octet-stream" }, body: audio });
+  const upj = await up.json().catch(() => ({}));
+  if (!up.ok || !upj.upload_url) throw new Error(`Transcription upload failed: ${upj.error || up.status}`);
+  // Meetings can have three or four voices, so the speaker count is left to AssemblyAI.
+  const tr = await fetch(`${AAI_BASE()}/v2/transcript`, {
+    method: "POST", headers: { authorization: AAI_KEY(), "content-type": "application/json" },
+    body: JSON.stringify({ audio_url: upj.upload_url, speaker_labels: true, language_code: "en" }),
+  });
+  const trj = await tr.json().catch(() => ({}));
+  if (!tr.ok || !trj.id) throw new Error(`Transcription failed to start: ${trj.error || tr.status}`);
+  hits.push(now); _sttHits.set(uid, hits);
+  _jobs.set(trj.id, { uid, at: now });
+  for (const [k, v] of _jobs) if (now - v.at > 6 * 3600e3) _jobs.delete(k);
+  return trj.id;
+}
+const _meetBusy = new Set();
+router.post("/meetings/upload", express.raw({ type: () => true, limit: `${MEET_MAX_MB}mb` }), async (req, res) => {
+  try {
+    const user = await userFromToken(req);
+    if (!user) return res.status(401).json({ error: "Sign in again." });
+    const recId = String(req.query.rec || "");
+    if (!MEET_ID_RE.test(recId)) return res.status(400).json({ error: "Missing or bad meeting id." });
+    const buf = Buffer.isBuffer(req.body) ? req.body : null;
+    if (!buf || buf.length < 256) return res.status(400).json({ error: "No audio received." });
+    const at = Number(req.query.at) > 1.6e12 && Number(req.query.at) < Date.now() + 864e5 ? Number(req.query.at) : Date.now();
+    const a = await archiveReady(MEET_PATH(), "Meeting archive");
+    const day = sastDay(new Date(at).toISOString());
+    const folder = await monthFolder(a.root, user.id, day.slice(0, 7));
+    const lock = `${user.id}|${recId}`;
+    if (_meetBusy.has(lock)) return res.status(409).json({ error: "This recording is already uploading." });
+    _meetBusy.add(lock);
+    try {
+      const d = await pcloud("listfolder", { folderid: folder });
+      const have = ((d.metadata && d.metadata.contents) || []).find((e) => { const m = !e.isfolder && String(e.name).match(MEET_NAME_RE); return m && m[2] === recId; });
+      let fileid, seconds = 0, audio = null, fresh = false;
+      if (have) {
+        fileid = String(have.fileid);
+        if (/\.mp3$/.test(have.name) && have.size) seconds = Math.round((have.size * 8) / 48000);
+      } else {
+        const ext = extFor(req.get("content-type") || "");
+        const mp3 = await fileToMp3(buf, ext);
+        audio = mp3 || buf;
+        if (mp3) seconds = Math.round((mp3.length * 8) / 48000);
+        fileid = await pcloudUpload(folder, `${day}_${recId}.${mp3 ? "mp3" : ext}`, audio, Math.floor(at / 1000));
+        fresh = true;
+      }
+      let job = null, sttError;
+      if (req.query.transcribe === "1" && AAI_KEY()) {
+        try { job = await meetTranscribe(user.id, audio || (await pcloudBytes(fileid))); }
+        catch (e) { sttError = e.message; }
+      }
+      console.log(`[meetings] upload user=${user.id.slice(0, 8)} rec=${recId} ${fresh ? `${Math.round(buf.length / 1024)}KB in` : "already kept"} ${seconds}s${job ? " +transcribe" : ""}`);
+      res.json({ fileid, seconds, job, stt: !!AAI_KEY(), existed: !fresh, sttError });
+    } finally { _meetBusy.delete(lock); }
+  } catch (e) { sendErr(res, e, "Meeting recording"); }
+});
+async function meetAllowed(req, res) {
+  const user = await userFromToken(req);
+  if (!user) { res.status(401).json({ error: "Sign in again." }); return null; }
+  const owner = (await roleOf(user.id)) === "owner";
+  const who = await archiveOwnerOf(req.params.fileid, MEET_PATH(), MEET_NAME_RE);
+  if (!who || (!owner && who.agentId !== user.id)) { res.status(404).json({ error: "No such recording for you." }); return null; }
+  return { user, who };
+}
+router.get("/meetings/play/:fileid", async (req, res) => {
+  try {
+    const ok = await meetAllowed(req, res); if (!ok) return;
+    const buf = await pcloudBytes(req.params.fileid);
+    res.set("Cache-Control", "private, no-store");
+    res.type(MEET_TYPES[String(ok.who.name).split(".").pop()] || "application/octet-stream");
+    res.send(buf);
+  } catch (e) { sendErr(res, e, "Meeting recording"); }
+});
+router.post("/meetings/transcribe/:fileid", async (req, res) => {
+  try {
+    if (!AAI_KEY()) return res.status(501).json({ error: "Transcription isn't set up — ASSEMBLYAI_API_KEY is not on the server." });
+    const ok = await meetAllowed(req, res); if (!ok) return;
+    const job = await meetTranscribe(ok.user.id, await pcloudBytes(req.params.fileid));
+    res.json({ job });
+  } catch (e) { sendErr(res, e, "Transcription"); }
+});
+
 router.get("/archive/health", async (_req, res) => {
   try {
     const a = await archiveRoot();
-    res.json({ ok: !!a.root && a.fenced, configured: !!PC_TOKEN(), fenced: a.fenced, why: a.why || undefined, sweep: "github-oidc", sweepRepo: SWEEP_REPO(), keepDays: ARCHIVE_KEEP_DAYS });
+    const mt = await archiveRoot(MEET_PATH()).catch((e) => ({ root: "", fenced: false, why: e.message }));
+    res.json({ ok: !!a.root && a.fenced, configured: !!PC_TOKEN(), fenced: a.fenced, why: a.why || undefined, sweep: "github-oidc", sweepRepo: SWEEP_REPO(), keepDays: ARCHIVE_KEEP_DAYS,
+      meetings: { ok: !!mt.root && mt.fenced, fenced: mt.fenced, why: mt.why || undefined, stt: !!AAI_KEY() } });
   } catch (e) { res.json({ ok: false, configured: !!PC_TOKEN(), error: e.message }); }
 });
 
-module.exports = { router, originate, fromOurWorkflow, _test: { saNumber, ourExtension, parseRecords, shapeCall, normNumber, sastIso, pruneArchive } };
+module.exports = { router, originate, fromOurWorkflow, _test: { saNumber, ourExtension, parseRecords, shapeCall, normNumber, sastIso, pruneArchive, MEET_NAME_RE } };
 
