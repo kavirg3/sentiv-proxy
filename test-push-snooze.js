@@ -41,6 +41,7 @@ router._setNow(() => now);
   check("a link to another site becomes the Hub", router._build({ endpoint: EP, title: "x", url: "https://evil.test/" }).payload.url === "https://hub.test/");
   check("a path stays on the Hub", router._build({ endpoint: EP, title: "x", url: "/?lead=L2" }).payload.url === "https://hub.test/?lead=L2");
   check("//evil is not a path", router._build({ endpoint: EP, title: "x", url: "//evil.test" }).payload.url === "https://hub.test/");
+  check("Digital Rewards logo kept, nothing else accepted as a brand", router._build({ endpoint: EP, title: "x", brand: "rewards" }).payload.brand === "rewards" && !router._build({ endpoint: EP, title: "x", brand: "evil" }).payload.brand);
   check("odd lead id dropped", !router._build({ endpoint: EP, title: "x", leadId: "L1');alert(1" }).payload.leadId);
   check("no endpoint / no title refused", !!router._build({ title: "x" }).error && !!router._build({ endpoint: EP }).error && !!router._build("x").error);
 

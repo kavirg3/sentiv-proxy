@@ -84,6 +84,7 @@ const good = (o = {}) => ({ name: "  Thandi   Mokoena ", business: "Café <b>Sol
   check("owner's phone is pushed for a new website lead", lp.length === 1 && lp[0].subs.length === 1, JSON.stringify(lp.map((x) => x.p)));
   check("push names the business, person, type and number", lp[0] && lp[0].p.title === "New website lead: Café b Sola /b" && lp[0].p.body === "Thandi Mokoena · Restaurant, café or takeaway · 082 123 4567", lp[0] && JSON.stringify(lp[0].p));
   check("tapping the push opens that lead", lp[0] && lp[0].p.url.endsWith(`/?lead=${leads[0].id}`) && lp[0].p.leadId === leads[0].id);
+  check("website lead alert shows the Digital Rewards logo", lp[0] && lp[0].p.brand === "rewards");
 
   r = await post(good({ website: "http://spam.example" }), "https://site.test", "2.2.2.2");
   check("a bot (honeypot filled) is thanked and nothing is saved", r.status === 200 && leads.length === 1);
@@ -176,6 +177,7 @@ const good = (o = {}) => ({ name: "  Thandi   Mokoena ", business: "Café <b>Sol
   r = await ppost(pa({ whatsapp: "0835551236" }));
   check("partner: a storage failure tells the visitor", r.status === 502 && /WhatsApp/.test((await r.json()).error) && pushes.length === 1);
   saveStatus = 200;
+  check("partner alert shows the Digital Rewards logo", pushes[0] && pushes[0].p.brand === "rewards");
   check("partner: push names suburb and hours", pushes[0].p.body.includes("Umhlanga") && pushes[0].p.body.includes("10 to 20 hours"), pushes[0].p.body);
 
   // the owner's Applicants list

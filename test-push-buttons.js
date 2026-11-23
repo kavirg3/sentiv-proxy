@@ -36,5 +36,13 @@ check("link: one alert's link doesn't leak", R._payloadFor({ id: "F1", data: {} 
 const fl = R._payloadFor({ id: "F1", data: { company: "Acme" } }, "followup", { followup: { links: { snooze: "https://cal.com/x" } } });
 check("link: follow-up snooze button can carry a link", fl.links && fl.links.snooze === "https://cal.com/x");
 
+// v348 — Digital Rewards deals carry brand "rewards" (the phone shows the DR logo)
+const rw = { id: "R1", agent_id: "a1", data: { company: "Café Sola", stage: "Lead", business: "rewards", updatedAt: Date.now() - 9 * 864e5 } };
+check("brand: rewards follow-up", R._payloadFor(rw, "followup", {}).brand === "rewards");
+check("brand: rewards going cold", R._payloadFor(rw, "stale", {}).brand === "rewards");
+check("brand: rewards chase the quote", R._payloadFor({ ...rw, data: { ...rw.data, stage: "Quotation Sent" } }, "quote", {}).brand === "rewards");
+check("brand: rewards deal won", R._wonPayloads({ ...rw, data: { ...rw.data, stage: "Closed Won" } }, { tpls: {}, phones: {}, people })[0].payload.brand === "rewards");
+check("brand: Sentiv deals carry none", R._payloadFor({ id: "S9", data: { company: "Acme" } }, "followup", {}).brand === undefined && won({}).brand === undefined);
+check("brand: buttons unchanged on a rewards alert", titles(R._payloadFor(rw, "followup", {})) === "Open lead | Snooze");
 console.log(fails.length ? `\n${fails.length} FAILED` : "\nall passed");
 process.exit(fails.length ? 1 : 0);

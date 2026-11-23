@@ -426,7 +426,13 @@ const cardName = (leadId) => `card-${sha12(`${SWEEP_SECRET || VAPID_PRIVATE}|${l
 // The service worker's own default for a deal alert, sent explicitly so it can be renamed.
 const DEAL_BTNS = () => [{ action: "open", title: "Open lead" }, { action: "snooze", title: "Snooze" }];
 // What a notification says, for each of the two reasons we send one.
+// v348 — alerts about a Digital Rewards deal carry brand "rewards": the service worker shows
+// the Digital Rewards logo instead of Sentiv's. Anything else stays Sentiv (no field).
+const rwBrand = (d) => (d && d.business === "rewards" ? { brand: "rewards" } : {});
 function payloadFor(r, kind, tpls) {
+  return { ...payloadFor0(r, kind, tpls), ...rwBrand(r.data) };
+}
+function payloadFor0(r, kind, tpls) {
   const d = r.data || {};
   const rand = typeof d.value === "number" && d.value > 0 ? ` · R${Math.round(d.value).toLocaleString("en-ZA")}` : "";
   if (kind === "quote") return quotePayload(r, tpls);
@@ -513,6 +519,7 @@ function wonPayloads(lead, ctx) {
     };
     Object.assign(out, relabel(out, "won", ctx.tpls, vars));
     if (image) out.image = image;
+    Object.assign(out, rwBrand(d));
     return { userId: p.id, payload: out };
   });
 }
@@ -543,7 +550,7 @@ const asLeads = (rows, keys) => (rows || []).map((r) => {
 });
 // Closed deals never get a sweep alert or count in the weekly note, so they stay in Supabase.
 const OPEN_ONLY = "or=(data->>stage.is.null,data->>stage.not.like.Closed*)";
-const SWEEP_KEYS = ["stage", "followUp", "updatedAt", "optOut", "value", "company", "contact", "phone", "directLine", "contacts"];
+const SWEEP_KEYS = ["stage", "followUp", "updatedAt", "optOut", "value", "company", "contact", "phone", "directLine", "contacts", "business"];
 const WEEK_KEYS = ["stage", "followUp", "updatedAt", "nextAction"];
 const WON_KEYS = ["stage", "closedAt", "business", "company", "value"];
 
@@ -757,6 +764,7 @@ router.post("/preview", async (req, res) => {
       if (kind === "followup" || kind === "stale") payload.actions = DEAL_BTNS();
       payload = relabel(payload, kind, tpls, SAMPLE);
     }
+    if (req.body && req.body.brand === "rewards") payload.brand = "rewards";   // v348 — previewed from the Digital Rewards side
     const out = await sendTo(subs, payload);
     res.json({ ok: true, devices: subs.length, ...out, image: !!payload.image });
   } catch (e) {

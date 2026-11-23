@@ -232,7 +232,7 @@ async function tellOwner(owner, a) {
     return await _push(subs, {
       title: `New area partner: ${a.name} · ${a.city}`,
       body: `${a.suburb} · ${a.experience} · ${a.hours} · ${a.phone}`,
-      tag: `partner-${a.file}`, url: `${hub}/`,
+      tag: `partner-${a.file}`, url: `${hub}/`, brand: "rewards",
     });
   } catch (e) { console.warn("partner-apply push error", e.message); return 0; }
 }
@@ -248,7 +248,7 @@ async function tellOwnerLead(owner, lead) {
     return await _push(subs, {
       title: `New website lead: ${lead.company}`,
       body: `${lead.contact} · ${lead.vertical} · ${lead.phone}${calc}`,
-      tag: `weblead-${lead.id}`, url: `${hub}/?lead=${encodeURIComponent(lead.id)}`, leadId: lead.id,
+      tag: `weblead-${lead.id}`, url: `${hub}/?lead=${encodeURIComponent(lead.id)}`, leadId: lead.id, brand: "rewards",
     });
   } catch (e) { console.warn("web-lead push error", e.message); return 0; }
 }

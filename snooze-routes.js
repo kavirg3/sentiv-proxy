@@ -77,6 +77,7 @@ function buildSnooze(body) {
   const payload = { title, body: clean(b.body, 400), tag: clean(b.tag, 100) || "snooze", url, snoozed: true };
   if (/^[A-Za-z0-9_-]{1,60}$/.test(String(b.leadId || ""))) payload.leadId = String(b.leadId);
   const img = httpsOk(b.image); if (img) payload.image = img;
+  if (b.brand === "rewards") payload.brand = "rewards";   // v348 — keeps the Digital Rewards logo when it comes back
   const wa = String(b.waUrl || ""); if (wa.indexOf("https://wa.me/") === 0 && httpsOk(wa)) payload.waUrl = wa;
   if (b.links && typeof b.links === "object") {
     const links = {};
