@@ -47,7 +47,8 @@ async function proxy() {
     ["POST", "/api/kuration/rows"], ["POST", "/api/team/invite"], ["GET", "/api/euphoria/calls"], ["POST", "/api/euphoria-originate"],
     ["POST", "/api/vbout-contact"], ["POST", "/api/manyreach-enroll"], ["POST", "/api/repliq-generate"], ["POST", "/api/push/test"], ["POST", "/api/push/remind/test"], ["GET", "/api/push/stats"],
     ["POST", "/api/euphoria/archive/sync"], ["GET", "/api/euphoria/archive/play/1"], ["GET", "/api/euphoria/archive/list"], ["POST", "/api/payfast/cancel"],
-    ["POST", "/api/euphoria/meetings/upload?rec=M1800000000000"], ["GET", "/api/euphoria/meetings/play/1"], ["POST", "/api/euphoria/meetings/transcribe/1"]];
+    ["POST", "/api/euphoria/meetings/upload?rec=M1800000000000"], ["GET", "/api/euphoria/meetings/play/1"], ["POST", "/api/euphoria/meetings/transcribe/1"],
+    ["POST", "/api/euphoria/tasks/files/upload?fid=F1800000000000&name=a.png"], ["GET", "/api/euphoria/tasks/files/1"], ["DELETE", "/api/euphoria/tasks/files/1"]];
   for (const [m, p] of closed) {
     const r = await get(`${PROXY}${p}`, { method: m, headers: { "Content-Type": "application/json" }, body: m === "GET" ? undefined : "{}" });
     check("Server lock", `${m} ${p} refuses strangers`, r.status === 401, `HTTP ${r.status}`);
@@ -66,6 +67,8 @@ async function proxy() {
   check("Phones", "call recordings are archived to pCloud, outside the Vault", arj.ok === true && arj.fenced === true, arj.why || arj.error || `HTTP ${ar.status}`);
   // Meeting recordings (Hub v339) sit beside them under the same fence and 12-month rule.
   check("Meetings", "meeting recordings are kept in pCloud, outside the Vault", !!(arj.meetings && arj.meetings.ok && arj.meetings.fenced), (arj.meetings && arj.meetings.why) || "no meetings block in archive health");
+  // Task files (Hub v344): attachments on Add a task, same fence.
+  check("Tasks", "task attachments are kept in pCloud, outside the Vault", !!(arj.taskFiles && arj.taskFiles.ok && arj.taskFiles.fenced), (arj.taskFiles && arj.taskFiles.why) || "no taskFiles block in archive health");
   if (arj.meetings && !arj.meetings.stt) warn("Meetings", "meeting transcripts with speaker names are OFF", "ASSEMBLYAI_API_KEY not set on Railway (audio is still kept)");
   check("Phones", "the daily archive sweep only answers this repo's GitHub workflow", arj.sweep === "github-oidc" && arj.sweepRepo === "kavirg3/sentiv-proxy", `${arj.sweep} ${arj.sweepRepo}`);
   const asw = await get(`${PROXY}/api/euphoria/archive/sweep`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });

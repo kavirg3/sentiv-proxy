@@ -584,9 +584,9 @@ async function pcloudFolder(params) {
   const d = await pcloud("createfolderifnotexists", params);
   return String(d.metadata.folderid);
 }
-async function pcloudUpload(folderid, name, buf, mtimeSec) {
+async function pcloudUpload(folderid, name, buf, mtimeSec, type) {
   const fd = new FormData();
-  fd.append("file", new Blob([buf], { type: name.endsWith(".mp3") ? "audio/mpeg" : "audio/wav" }), name);
+  fd.append("file", new Blob([buf], { type: type || (name.endsWith(".mp3") ? "audio/mpeg" : "audio/wav") }), name);
   const params = { folderid, nopartial: 1 };
   if (mtimeSec) params.mtime = mtimeSec;
   const d = await pcloud("uploadfile", params, fd);
@@ -1062,12 +1062,101 @@ router.post("/meetings/transcribe/:fileid", async (req, res) => {
   } catch (e) { sendErr(res, e, "Transcription"); }
 });
 
+// =====================================================================================
+// TASK FILES (23 Nov 2026, Hub v344)
+//
+// "Add a task" can carry files and screenshots. They live in pCloud, beside the call and
+// meeting recordings and under the same fence (never inside the agents' Vault):
+//
+//     /Sentiv Task Files/<user id>/<YYYY-MM>/<YYYY-MM-DD>_F<digits>.<ext>
+//
+// The Hub keeps the original file name on the task; pCloud only holds the id-based name.
+// Only the person who attached it, or the owner, can open or delete it. Kept as long as
+// the task wants it — no 12-month sweep.
+//
+// POST   /api/euphoria/tasks/files/upload?fid=F<digits>&name=<original>   signed in.
+//        Body = the raw file. Same fid twice → the first copy is kept.  → { fileid, size, type }
+// GET    /api/euphoria/tasks/files/:fileid      signed in, uploader or owner. The file.
+// DELETE /api/euphoria/tasks/files/:fileid      signed in, uploader or owner.
+// =====================================================================================
+const TASKF_PATH = () => clean(process.env.TASK_FILES_PATH) || "/Sentiv Task Files";
+const TASKF_NAME_RE = /^(\d{4}-\d{2}-\d{2})_(F\d{6,20})\.([a-z0-9]{1,5})$/;
+const TASKF_ID_RE = /^F\d{6,20}$/;
+const TASKF_MAX_MB = 15;
+const TASKF_TYPES = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", heic: "image/heic",
+  pdf: "application/pdf", txt: "text/plain", csv: "text/csv",
+  doc: "application/msword", docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xls: "application/vnd.ms-excel", xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ppt: "application/vnd.ms-powerpoint", pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+};
+const taskExt = (name, ct) => {
+  const e = String(name || "").toLowerCase().split(".").pop();
+  if (TASKF_TYPES[e]) return e;
+  const hit = Object.entries(TASKF_TYPES).find(([, t]) => t === String(ct || "").split(";")[0].trim().toLowerCase());
+  return hit ? hit[0] : "";
+};
+const _taskBusy = new Set();
+router.post("/tasks/files/upload", express.raw({ type: () => true, limit: `${TASKF_MAX_MB}mb` }), async (req, res) => {
+  try {
+    const user = await userFromToken(req);
+    if (!user) return res.status(401).json({ error: "Sign in again." });
+    const fid = String(req.query.fid || "");
+    if (!TASKF_ID_RE.test(fid)) return res.status(400).json({ error: "Missing or bad file id." });
+    const ext = taskExt(req.query.name, req.get("content-type"));
+    if (!ext) return res.status(415).json({ error: "That kind of file can't be attached. Use a picture, PDF, Word, Excel, PowerPoint, text or CSV file." });
+    const buf = Buffer.isBuffer(req.body) ? req.body : null;
+    if (!buf || !buf.length) return res.status(400).json({ error: "No file received." });
+    const a = await archiveReady(TASKF_PATH(), "Task files");
+    const day = sastDay(new Date().toISOString());
+    const folder = await monthFolder(a.root, user.id, day.slice(0, 7));
+    const lock = `${user.id}|${fid}`;
+    if (_taskBusy.has(lock)) return res.status(409).json({ error: "This file is already uploading." });
+    _taskBusy.add(lock);
+    try {
+      const d = await pcloud("listfolder", { folderid: folder });
+      const have = ((d.metadata && d.metadata.contents) || []).find((e) => { const m = !e.isfolder && String(e.name).match(TASKF_NAME_RE); return m && m[2] === fid; });
+      const fileid = have ? String(have.fileid) : await pcloudUpload(folder, `${day}_${fid}.${ext}`, buf, 0, TASKF_TYPES[ext]);
+      console.log(`[taskfiles] upload user=${user.id.slice(0, 8)} ${fid}.${ext} ${have ? "already kept" : `${Math.round(buf.length / 1024)}KB`}`);
+      res.json({ fileid, size: have ? have.size : buf.length, type: TASKF_TYPES[ext], existed: !!have });
+    } finally { _taskBusy.delete(lock); }
+  } catch (e) { sendErr(res, e, "Task file"); }
+});
+async function taskFileAllowed(req, res) {
+  const user = await userFromToken(req);
+  if (!user) { res.status(401).json({ error: "Sign in again." }); return null; }
+  const owner = (await roleOf(user.id)) === "owner";
+  const who = await archiveOwnerOf(req.params.fileid, TASKF_PATH(), TASKF_NAME_RE);
+  if (!who || (!owner && who.agentId !== user.id)) { res.status(404).json({ error: "No such file for you." }); return null; }
+  return { user, who };
+}
+router.get("/tasks/files/:fileid", async (req, res) => {
+  try {
+    const ok = await taskFileAllowed(req, res); if (!ok) return;
+    const buf = await pcloudBytes(req.params.fileid);
+    res.set("Cache-Control", "private, no-store");
+    res.set("X-Content-Type-Options", "nosniff");
+    res.type(TASKF_TYPES[String(ok.who.name).split(".").pop()] || "application/octet-stream");
+    res.send(buf);
+  } catch (e) { sendErr(res, e, "Task file"); }
+});
+router.delete("/tasks/files/:fileid", async (req, res) => {
+  try {
+    const ok = await taskFileAllowed(req, res); if (!ok) return;
+    await pcloud("deletefile", { fileid: req.params.fileid });
+    console.log(`[taskfiles] delete user=${ok.user.id.slice(0, 8)} ${ok.who.name}`);
+    res.json({ ok: true });
+  } catch (e) { sendErr(res, e, "Task file"); }
+});
+
 router.get("/archive/health", async (_req, res) => {
   try {
     const a = await archiveRoot();
     const mt = await archiveRoot(MEET_PATH()).catch((e) => ({ root: "", fenced: false, why: e.message }));
+    const tf = await archiveRoot(TASKF_PATH()).catch((e) => ({ root: "", fenced: false, why: e.message }));
     res.json({ ok: !!a.root && a.fenced, configured: !!PC_TOKEN(), fenced: a.fenced, why: a.why || undefined, sweep: "github-oidc", sweepRepo: SWEEP_REPO(), keepDays: ARCHIVE_KEEP_DAYS,
-      meetings: { ok: !!mt.root && mt.fenced, fenced: mt.fenced, why: mt.why || undefined, stt: !!AAI_KEY() } });
+      meetings: { ok: !!mt.root && mt.fenced, fenced: mt.fenced, why: mt.why || undefined, stt: !!AAI_KEY() },
+      taskFiles: { ok: !!tf.root && tf.fenced, fenced: tf.fenced, why: tf.why || undefined } });
   } catch (e) { res.json({ ok: false, configured: !!PC_TOKEN(), error: e.message }); }
 });
 
