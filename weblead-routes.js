@@ -187,7 +187,8 @@ function buildPartnerApp(body, now) {
   if (!PARTNER_EXPERIENCE.includes(experience)) return { error: "Please choose your sales experience." };
   if (suburb.length < 2) return { error: "Please enter the suburb you live in." };
   if (!PARTNER_WORK.includes(work)) return { error: "Please choose what you do now." };
-  if (!PARTNER_HOURS.includes(hours)) return { error: "Please choose how many hours a week you have." };
+  // Hours a week left the form on 23 Nov 2026; older pages may still send it, so it is checked only when present.
+  if (hours && !PARTNER_HOURS.includes(hours)) return { error: "Please choose how many hours a week you have." };
   if (car === null) return { error: "Please tell us if you have your own transport." };
   if (laptop === null) return { error: "Please tell us if you have your own laptop." };
   if (!languages.length) return { error: "Please tick at least one language." };
@@ -241,7 +242,7 @@ async function tellOwner(owner, a) {
     const hub = env("PUSH_APP_URL").replace(/\/+$/, "") || "https://sentiv-sales-hub.pages.dev";
     return await _push(subs, {
       title: `New area partner: ${a.name} · ${a.city}`,
-      body: `${a.suburb} · ${a.experience} · ${a.hours} · ${a.phone}`,
+      body: [a.suburb, a.experience, a.hours, a.phone].filter(Boolean).join(" · "),
       tag: `partner-${a.file}`, url: `${hub}/`, brand: "rewards",
       // Layout 2: two buttons
       ...(waLink(a.phone) ? { waUrl: waLink(a.phone), actions: [{ action: "open", title: "Open" }, { action: "wa", title: "WhatsApp them" }] }
