@@ -17,6 +17,7 @@
 //   - at most 5 posts per address in 10 minutes and WEBLEAD_DAILY_CAP (100) a day in all.
 //   - the same email or number twice within a day saves one lead.
 //   SUPABASE_URL, SUPABASE_SERVICE_KEY  required — owner lookup + lead insert.
+//   Each saved enquiry also pushes the owner's phone (23 Nov 2026); tapping it opens the lead.
 const express = require("express");
 const router = express.Router();
 
@@ -32,8 +33,8 @@ router._setFetch = (f) => { _fetch = f; };   // tests
 let _now = () => Date.now();
 router._setNow = (f) => { _now = f; };       // tests
 
-const TYPES = ["Restaurant, café or takeaway", "Cannabis retailer", "Butchery or speciality retail", "Shopping centre", "Salon or barber",
-  "Spa or beauty", "Hotel or hospitality", "Gym or fitness", "Retail store", "Other"];
+const TYPES = ["Shopping centre", "Restaurant, café or takeaway", "Salon or barber", "Spa or beauty", "Butchery or speciality retail",
+  "Hotel or hospitality", "Gym or fitness", "Retail store", "Other"];
 const clean = (v, max) => String(v == null ? "" : v).replace(/[\u0000-\u001f\u007f<>]/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
 // South African numbers only, stored the way the Hub shows them: "082 123 4567".
 function saPhone(v) {
@@ -143,6 +144,7 @@ router.post("/web-lead", async (req, res) => {
     if (!r.ok) { console.error("web-lead insert failed", r.status, (await r.text()).slice(0, 200)); return res.status(502).json({ error: "Could not save your request. Please WhatsApp us." }); }
     console.log("web-lead saved", JSON.stringify({ id: row.id, type: built.lead.vertical, branches: built.lead.branches }));
     res.json({ ok: true });
+    tellOwnerLead(owner, built.lead).then((n) => console.log("web-lead push", JSON.stringify({ id: row.id, pushed: n })));
   } catch (e) {
     console.error("web-lead error", e.message);
     res.status(502).json({ error: "Could not save your request. Please WhatsApp us." });
@@ -215,7 +217,7 @@ let _push = async (subs, payload) => {
       await webpush.sendNotification({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, JSON.stringify(payload),
         { TTL: 3600 * 24, urgency: "normal", vapidDetails: { subject: subj, publicKey: pub, privateKey: priv } });
       sent++;
-    } catch (e) { console.warn("partner-apply push failed", (e && e.statusCode) || "", (e && e.message) || e); }
+    } catch (e) { console.warn("push failed", (e && e.statusCode) || "", (e && e.message) || e); }
   }
   return sent;
 };
@@ -233,6 +235,22 @@ async function tellOwner(owner, a) {
       tag: `partner-${a.file}`, url: `${hub}/`,
     });
   } catch (e) { console.warn("partner-apply push error", e.message); return 0; }
+}
+
+// A new website enquiry: buzz the owner straight away (leads go cold fast). Tapping opens the lead in the Hub.
+async function tellOwnerLead(owner, lead) {
+  try {
+    const r = await _fetch(`${SB_URL()}/rest/v1/push_subscriptions?select=endpoint,p256dh,auth&user_id=eq.${owner}`, { headers: svc() });
+    const subs = r.ok ? await r.json() : [];
+    if (!Array.isArray(subs) || !subs.length) return 0;
+    const hub = env("PUSH_APP_URL").replace(/\/+$/, "") || "https://sentiv-sales-hub.pages.dev";
+    const calc = /Calculator: /.test(lead.notes) ? " · used the calculator" : "";
+    return await _push(subs, {
+      title: `New website lead: ${lead.company}`,
+      body: `${lead.contact} · ${lead.vertical} · ${lead.phone}${calc}`,
+      tag: `weblead-${lead.id}`, url: `${hub}/?lead=${encodeURIComponent(lead.id)}`, leadId: lead.id,
+    });
+  } catch (e) { console.warn("web-lead push error", e.message); return 0; }
 }
 
 router.post("/partner-apply", async (req, res) => {

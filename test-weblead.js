@@ -79,6 +79,11 @@ const good = (o = {}) => ({ name: "  Thandi   Mokoena ", business: "Café <b>Sol
   check("the browser may read the answer", r.headers.get("access-control-allow-origin") === "https://site.test");
   check("one lead saved, on the owner's row", leads.length === 1 && leads[0].agent_id === "u-owner" && leads[0].id === leads[0].data.id && leads[0].data.business === "rewards");
   check("saved with a timestamp", leads[0].updated_at === new Date(now).toISOString());
+  await new Promise((ok) => setTimeout(ok, 30));
+  const lp = pushes.filter((x) => String(x.p.tag).startsWith("weblead-"));
+  check("owner's phone is pushed for a new website lead", lp.length === 1 && lp[0].subs.length === 1, JSON.stringify(lp.map((x) => x.p)));
+  check("push names the business, person, type and number", lp[0] && lp[0].p.title === "New website lead: Café b Sola /b" && lp[0].p.body === "Thandi Mokoena · Restaurant, café or takeaway · 082 123 4567", lp[0] && JSON.stringify(lp[0].p));
+  check("tapping the push opens that lead", lp[0] && lp[0].p.url.endsWith(`/?lead=${leads[0].id}`) && lp[0].p.leadId === leads[0].id);
 
   r = await post(good({ website: "http://spam.example" }), "https://site.test", "2.2.2.2");
   check("a bot (honeypot filled) is thanked and nothing is saved", r.status === 200 && leads.length === 1);
@@ -96,6 +101,13 @@ const good = (o = {}) => ({ name: "  Thandi   Mokoena ", business: "Café <b>Sol
   check("same number, different email: still one lead", r.status === 200 && leads.length === 1);
   r = await post(good({ email: "second@shop.test", whatsapp: "0731112222", business: "Second Shop" }), "https://www.site.test", "2.2.2.2");
   check("a second business is saved (www origin too)", r.status === 200 && leads.length === 2);
+  await new Promise((ok) => setTimeout(ok, 30));
+  check("no push for bots, refusals or repeats — one per saved lead", pushes.filter((x) => String(x.p.tag).startsWith("weblead-")).length === 2);
+  r = await post(good({ email: "calc@shop.test", whatsapp: "0739998888", business: "Calc Shop", challenge: "Wants: Managed Growth. Calculator: 500 customers a month" }), "https://site.test", "2.2.2.2");
+  await new Promise((ok) => setTimeout(ok, 30));
+  check("push says when the owner used the calculator", /used the calculator$/.test(pushes[pushes.length - 1].p.body), pushes[pushes.length - 1].p.body);
+  check("cannabis is no longer an accepted business type", !!buildWebLead(good({ type: "Cannabis retailer" }), now).error);
+  leads = leads.slice(0, 2);
 
   // limits
   router._resetLimits(); leads = [];
@@ -122,6 +134,7 @@ const good = (o = {}) => ({ name: "  Thandi   Mokoena ", business: "Café <b>Sol
   check("broken JSON is refused", r.status === 400, `HTTP ${r.status}`);
 
   // ---- area partner applications ----
+  await new Promise((ok) => setTimeout(ok, 30)); pushes.length = 0;   // website-lead pushes above are checked already
   const { buildPartnerApp } = router;
   const pa = (o = {}) => ({ name: " Sipho  Dlamini ", city: "Durban", experience: "1 to 3 years", car: "yes", email: "Sipho@Mail.test", whatsapp: "082 555 1234",
     about: "Sold <b>insurance</b>\nfor two years", consent: "on", suburb: " Umhlanga ", work: "Part-time job", hours: "10 to 20 hours", laptop: "yes",
