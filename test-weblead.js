@@ -152,6 +152,7 @@ const good = (o = {}) => ({ name: "  Thandi   Mokoena ", business: "Café <b>Sol
     ["bad email", { email: "x" }], ["bad phone", { whatsapp: "12" }], ["no consent", { consent: "" }]]) check(`partner refused: ${n}`, !!buildPartnerApp(pa(o), now).error);
   check("partner: new fields kept", A.suburb === "Umhlanga" && A.work === "Part-time job" && A.hours === "10 to 20 hours" && A.laptop === true && A.heard === "LinkedIn" && A.status === "New");
   { const r = buildPartnerApp(pa({ hours: "" }), now); check("partner: hours is optional now", !r.error && r.app.hours === "", r.error); }
+  { const r = buildPartnerApp(pa({ work: "", heard: "", hours: "" }), now); check("partner: work + heard optional now (24 Nov form)", !r.error && r.app.work === "" && r.app.heard === "", r.error); }
   check("partner: only known languages", JSON.stringify(A.languages) === '["English","isiZulu"]', JSON.stringify(A.languages));
   check("partner: LinkedIn link gets https", A.linkedin === "https://linkedin.com/in/sipho", A.linkedin);
   check("partner: languages as a comma string work", buildPartnerApp(pa({ languages: "Afrikaans,English" }), now).app.languages.length === 2);

@@ -187,13 +187,14 @@ function buildPartnerApp(body, now) {
   if (!PARTNER_CITIES.includes(city)) return { error: "Please choose your city." };
   if (!PARTNER_EXPERIENCE.includes(experience)) return { error: "Please choose your sales experience." };
   if (suburb.length < 2) return { error: "Please enter the suburb you live in." };
-  if (!PARTNER_WORK.includes(work)) return { error: "Please choose what you do now." };
+  // "What you do now" and "Where did you hear about us" left the form on 24 Nov 2026; checked only when an older page sends them.
+  if (work && !PARTNER_WORK.includes(work)) return { error: "Please choose what you do now." };
   // Hours a week left the form on 23 Nov 2026; older pages may still send it, so it is checked only when present.
   if (hours && !PARTNER_HOURS.includes(hours)) return { error: "Please choose how many hours a week you have." };
   if (car === null) return { error: "Please tell us if you have your own transport." };
   if (laptop === null) return { error: "Please tell us if you have your own laptop." };
   if (!languages.length) return { error: "Please tick at least one language." };
-  if (!PARTNER_HEARD.includes(heard)) return { error: "Please tell us where you heard about us." };
+  if (heard && !PARTNER_HEARD.includes(heard)) return { error: "Please tell us where you heard about us." };
   if (linkedin && !/^https:\/\/([a-z]{2,3}\.)?linkedin\.com\/[^\s]*$/i.test(linkedin)) return { error: "Please enter a LinkedIn profile link, or leave it empty." };
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return { error: "Please enter a valid email address." };
   if (!phone) return { error: "Please enter a valid South African WhatsApp number." };
