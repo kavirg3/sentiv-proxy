@@ -127,6 +127,12 @@ async function proxy() {
   const paList = await get(`${PROXY}/api/rewards/partner-apps`);
   check("Website form", "partner applications cannot be read without signing in", paList.status === 401, `HTTP ${paList.status}`);
 
+  // Snooze on an alert (Hub v347): open to the service worker, but only for a device that is
+  // a saved push subscription. A made-up device must be refused, never queued.
+  const sz = await get(`${PROXY}/api/push/snooze`, { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ endpoint: "https://fcm.googleapis.com/fcm/send/health-check-not-a-device", title: "Health check" }) });
+  check("Push", "snooze route is up and refuses an unknown device", sz.status === 404, `HTTP ${sz.status}`);
+
   const ku = await get(`${PROXY}/api/kuration/health`);
   check("Lead research", "Kuration route is up", ku.status === 200, `HTTP ${ku.status}`);
   const wa = await get(`${PROXY}/api/whatsapp/health`);

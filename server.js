@@ -54,6 +54,7 @@ const PUBLIC_ROUTES = [
   ["GET", /^\/api\/push\/key$/],            // VAPID PUBLIC key — public by definition
   ["GET", /^\/api\/push\/health$/],
   ["POST", /^\/api\/push\/sweep$/],          // x-sweep-secret
+  ["POST", /^\/api\/push\/snooze$/],         // the service worker's own push endpoint must be a saved subscription; re-sends only to it (snooze-routes.js)
   ["POST", /^\/api\/push\/alert$/],          // GitHub-signed OIDC token (health-check workflow)
   ["POST", /^\/api\/push\/weekplan$/],       // GitHub-signed OIDC token (Sunday week-plan workflow)
   ["GET", /^\/api\/push\/img\/[a-z]+-[0-9a-f]{12}\.(jpg|png|webp)$/],   // notification pictures — phones fetch them with no sign-in
@@ -108,6 +109,7 @@ app.use("/api", async (req, res, next) => {
 app.use("/api/kuration", require("./kuration-routes"));
 app.use("/api/pcloud", require("./pcloud-routes"));
 app.use("/api/whatsapp", require("./whatsapp-routes"));
+app.use("/api/push/snooze", require("./snooze-routes"));   // before /api/push: Snooze on an alert brings it back in an hour
 app.use("/api/push", require("./push-routes"));
 app.use("/api/team", require("./team-routes"));
 app.use("/api/payfast", require("./payfast-routes"));       // Digital Rewards invoices + card payments (PAYFAST_* keys)
