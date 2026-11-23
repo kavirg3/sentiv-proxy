@@ -85,6 +85,10 @@ const good = (o = {}) => ({ name: "  Thandi   Mokoena ", business: "Café <b>Sol
   check("push names the business, person, type and number", lp[0] && lp[0].p.title === "New website lead: Café b Sola /b" && lp[0].p.body === "Thandi Mokoena · Restaurant, café or takeaway · 082 123 4567", lp[0] && JSON.stringify(lp[0].p));
   check("tapping the push opens that lead", lp[0] && lp[0].p.url.endsWith(`/?lead=${leads[0].id}`) && lp[0].p.leadId === leads[0].id);
   check("website lead alert shows the Digital Rewards logo", lp[0] && lp[0].p.brand === "rewards");
+  check("website lead alert stays on screen", lp[0] && lp[0].p.sticky === true);
+  check("website lead buttons: Open lead · WhatsApp them", lp[0] && JSON.stringify(lp[0].p.actions) === '[{"action":"open","title":"Open lead"},{"action":"wa","title":"WhatsApp them"}]', lp[0] && JSON.stringify(lp[0].p.actions));
+  check("WhatsApp opens the lead's own chat, nothing typed", lp[0] && lp[0].p.waUrl === "https://wa.me/27821234567", lp[0] && lp[0].p.waUrl);
+  check("wa link: landline gets none", router._waLink("011 555 1234") === "" && router._waLink("073 999 8888") === "https://wa.me/27739998888" && router._waLink("") === "");
 
   r = await post(good({ website: "http://spam.example" }), "https://site.test", "2.2.2.2");
   check("a bot (honeypot filled) is thanked and nothing is saved", r.status === 200 && leads.length === 1);
@@ -178,6 +182,8 @@ const good = (o = {}) => ({ name: "  Thandi   Mokoena ", business: "Café <b>Sol
   check("partner: a storage failure tells the visitor", r.status === 502 && /WhatsApp/.test((await r.json()).error) && pushes.length === 1);
   saveStatus = 200;
   check("partner alert shows the Digital Rewards logo", pushes[0] && pushes[0].p.brand === "rewards");
+  check("partner buttons: Open · WhatsApp them, to the applicant", pushes[0] && JSON.stringify(pushes[0].p.actions) === '[{"action":"open","title":"Open"},{"action":"wa","title":"WhatsApp them"}]' && pushes[0].p.waUrl === "https://wa.me/27825551234", pushes[0] && JSON.stringify(pushes[0].p));
+  check("partner alert does not stay on screen", pushes[0] && !pushes[0].p.sticky);
   check("partner: push names suburb and hours", pushes[0].p.body.includes("Umhlanga") && pushes[0].p.body.includes("10 to 20 hours"), pushes[0].p.body);
 
   // the owner's Applicants list

@@ -223,6 +223,16 @@ let _push = async (subs, payload) => {
 };
 router._setPush = (f) => { _push = f; };   // tests
 
+// Kavir's layout picks (23 Nov 2026): a WhatsApp button that opens a chat with the person, no text
+// typed for him. Only cellphones take WhatsApp; a landline gets no WhatsApp button.
+// "082 123 4567" → "https://wa.me/27821234567"
+function waLink(phone) {
+  const d = String(phone || "").replace(/\D/g, "");
+  const intl = d.startsWith("0") ? "27" + d.slice(1) : d;
+  return /^27[6-8]\d{8}$/.test(intl) ? `https://wa.me/${intl}` : "";
+}
+router._waLink = waLink;
+
 async function tellOwner(owner, a) {
   try {
     const r = await _fetch(`${SB_URL()}/rest/v1/push_subscriptions?select=endpoint,p256dh,auth&user_id=eq.${owner}`, { headers: svc() });
@@ -233,6 +243,9 @@ async function tellOwner(owner, a) {
       title: `New area partner: ${a.name} · ${a.city}`,
       body: `${a.suburb} · ${a.experience} · ${a.hours} · ${a.phone}`,
       tag: `partner-${a.file}`, url: `${hub}/`, brand: "rewards",
+      // Layout 2: two buttons
+      ...(waLink(a.phone) ? { waUrl: waLink(a.phone), actions: [{ action: "open", title: "Open" }, { action: "wa", title: "WhatsApp them" }] }
+        : { actions: [{ action: "open", title: "Open" }] }),
     });
   } catch (e) { console.warn("partner-apply push error", e.message); return 0; }
 }
@@ -249,6 +262,10 @@ async function tellOwnerLead(owner, lead) {
       title: `New website lead: ${lead.company}`,
       body: `${lead.contact} · ${lead.vertical} · ${lead.phone}${calc}`,
       tag: `weblead-${lead.id}`, url: `${hub}/?lead=${encodeURIComponent(lead.id)}`, leadId: lead.id, brand: "rewards",
+      // Layout 5: stays on screen until tapped, with Open lead + WhatsApp them (a landline: Open lead only)
+      sticky: true,
+      ...(waLink(lead.phone) ? { waUrl: waLink(lead.phone), actions: [{ action: "open", title: "Open lead" }, { action: "wa", title: "WhatsApp them" }] }
+        : { actions: [{ action: "open", title: "Open lead" }] }),
     });
   } catch (e) { console.warn("web-lead push error", e.message); return 0; }
 }
