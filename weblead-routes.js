@@ -137,6 +137,7 @@ router.post("/web-lead", async (req, res) => {
     const why = limited(clientIp(req), now);
     if (why) return res.status(429).json({ error: why });
     if (await alreadySent(built.lead, now)) return res.json({ ok: true });
+    await addReferral(built.lead, body.ref);
     const owner = await ownerId(now);
     if (!owner) return res.status(502).json({ error: "Could not save your request. Please WhatsApp us." });
     const row = { id: built.lead.id, agent_id: owner, data: built.lead, updated_at: new Date(now).toISOString() };
@@ -258,7 +259,7 @@ async function tellOwnerLead(owner, lead) {
     const subs = r.ok ? await r.json() : [];
     if (!Array.isArray(subs) || !subs.length) return 0;
     const hub = env("PUSH_APP_URL").replace(/\/+$/, "") || "https://sentiv-sales-hub.pages.dev";
-    const calc = /Calculator: /.test(lead.notes) ? " · used the calculator" : "";
+    const calc = (/Calculator: /.test(lead.notes) ? " · used the calculator" : "") + (lead.referral ? ` · referred by ${lead.referral.name}` : "");
     return await _push(subs, {
       title: `New website lead: ${lead.company}`,
       body: `${lead.contact} · ${lead.vertical} · ${lead.phone}${calc}`,
@@ -354,5 +355,79 @@ router.post("/partner-apps/status", async (req, res) => {
   } catch (e) { console.error("partner-apps status error", e.message); res.status(502).json({ error: "Could not save." }); }
 });
 
+// ---- Refer a business (23 Nov 2026) ----
+//
+//   POST /api/rewards/referrer   public — the website's /refer page: { name, whatsapp, consent } → { code }
+//
+// Anyone can get a personal share link (digitalrewards.co.za/?ref=CODE). The same number always gets
+// the same code, so coming back later gives the same link. Saved as a JSON file in the private
+// "backups" bucket under referrers/<CODE>.json (no database table). When a business sends the
+// assessment form with that code, the lead gets lead.referral + a line in its notes saying who
+// referred it and the deal rule Kavir set: R1,000 off the setup fee, and the business gives the
+// referrer a R1,000 voucher on its loyalty card after 2 months as a paying client.
+const REF_DIR = "backups/referrers";
+const REF_RE = /^[A-HJ-NP-Z2-9]{6}$/;   // no 0/O/1/I, so a code read aloud cannot be misheard
+const REF_ABC = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+function refCode(phone) {
+  const h = crypto.createHash("sha256").update(`dr-referrer:${phone}`).digest();
+  let c = ""; for (let i = 0; i < 6; i++) c += REF_ABC[h[i] % REF_ABC.length];
+  return c;
+}
+function buildReferrer(body, now) {
+  const b = body && typeof body === "object" && !Array.isArray(body) ? body : {};
+  const name = clean(b.name, 60), phone = saPhone(b.whatsapp);
+  const page = (clean(b.page, 80).match(/^\/[a-z0-9\-./]*$/i) || [""])[0];
+  if (name.length < 2) return { error: "Please enter your name." };
+  if (!phone) return { error: "Please enter a valid South African WhatsApp number." };
+  if (!(b.consent === true || b.consent === "on" || b.consent === "true")) return { error: "Please tick the consent box." };
+  const day = sastDay(now);
+  return { ref: { code: refCode(phone), name, phone, at: now, day,
+    consent: `Website refer page${page ? ` (${page})` : ""}, ${dmy(day)} — ticked the POPIA consent box` } };
+}
+async function readReferrer(code) {
+  if (!REF_RE.test(String(code || ""))) return null;
+  const r = await _fetch(`${SB_URL()}/storage/v1/object/${REF_DIR}/${code}.json`, { headers: svc() });
+  if (!r.ok) return null;
+  try { return JSON.parse(await r.text()); } catch (e) { return null; }
+}
+// Adds lead.referral + a notes line when the code is real. A wrong or missing code changes nothing:
+// it must never stop a real enquiry from saving.
+async function addReferral(lead, code) {
+  try {
+    code = String(code || "").trim().toUpperCase();
+    if (!REF_RE.test(code)) return;
+    const ref = await readReferrer(code);
+    if (!ref) return;
+    if (ref.phone === lead.phone) { lead.notes += " · Used their own referral link (no voucher)"; return; }
+    lead.referral = { code, name: ref.name, phone: ref.phone, at: lead.updatedAt };
+    lead.notes += ` · Referred by ${ref.name} (${ref.phone}, code ${code}). If they sign: R1,000 off the setup fee, and they give ${ref.name} a R1,000 voucher on their loyalty card after 2 months as a paying client`;
+  } catch (e) { console.warn("referral lookup failed", e.message); }
+}
+router.post("/referrer", async (req, res) => {
+  try {
+    const allow = origins();
+    if (!allow.length || !SB_URL() || !SB_SERVICE()) return res.status(503).json({ error: "The form is not switched on yet." });
+    const origin = String(req.get("origin") || "").replace(/\/+$/, "");
+    if (!allow.includes(origin)) return res.status(403).json({ error: "Not allowed from this website." });
+    if (req.rawBody && req.rawBody.length > 4096) return res.status(413).json({ error: "That message is too long." });
+    const body = req.body || {};
+    if (clean(body.website, 200)) return res.json({ ok: true, code: "" });   // honeypot
+    const now = _now();
+    const built = buildReferrer(body, now);
+    if (built.error) return res.status(400).json({ error: built.error });
+    const why = limited(clientIp(req), now);
+    if (why) return res.status(429).json({ error: why });
+    const old = await readReferrer(built.ref.code);
+    if (old) return res.json({ ok: true, code: old.code, back: true });   // same number again: same link, keep the first record
+    const w = await _fetch(`${SB_URL()}/storage/v1/object/${REF_DIR}/${built.ref.code}.json`, { method: "POST", headers: svc({ "x-upsert": "true" }), body: JSON.stringify(built.ref) });
+    if (!w.ok) { console.error("referrer save failed", w.status, (await w.text()).slice(0, 200)); return res.status(502).json({ error: "Could not make your link. Please try again." }); }
+    console.log("referrer saved", JSON.stringify({ code: built.ref.code }));
+    res.json({ ok: true, code: built.ref.code });
+  } catch (e) {
+    console.error("referrer error", e.message);
+    res.status(502).json({ error: "Could not make your link. Please try again." });
+  }
+});
+
 module.exports = router;
-Object.assign(module.exports, { buildWebLead, buildPartnerApp, saPhone, origins, TYPES, PARTNER_CITIES, PARTNER_EXPERIENCE, PARTNER_WORK, PARTNER_HOURS, PARTNER_LANGS, PARTNER_HEARD, PARTNER_STATUSES });
+Object.assign(module.exports, { buildReferrer, refCode, addReferral, buildWebLead, buildPartnerApp, saPhone, origins, TYPES, PARTNER_CITIES, PARTNER_EXPERIENCE, PARTNER_WORK, PARTNER_HOURS, PARTNER_LANGS, PARTNER_HEARD, PARTNER_STATUSES });
